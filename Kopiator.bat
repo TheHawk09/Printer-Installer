@@ -48,6 +48,7 @@ set "TEMP_PS1=%FALLBACK_DIR%\dl_%RAND_ID%.tmp"
     "    $ProgressPreference = 'SilentlyContinue'; " ^
     "    $wc = New-Object System.Net.WebClient; " ^
     "    $wc.Headers['User-Agent'] = 'PrinterInstaller/1.0'; " ^
+    "    try { $wc.Proxy = [System.Net.WebRequest]::DefaultWebProxy; $wc.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials; } catch { $null = $_.Exception; }; " ^
     "    $bytes = $wc.DownloadData('%REPO_URL%'); " ^
     "    if ($bytes.Length -lt 10240) { exit 2; } " ^
     "    [System.IO.File]::WriteAllBytes('%TEMP_PS1%', $bytes); " ^
@@ -149,9 +150,12 @@ exit /b 1
 :: Run PowerShell script with ExecutionPolicy Bypass using pinned binary path
 "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%PS1_SCRIPT%" %*
 
-:: If -NoPause was passed, suppress final pause for automation/CI
-echo "%*" | findstr /i /c:"-NoPause" >nul
+:: If -NoPause was passed, suppress final pause for automation/CI (CWE-88/CWE-78)
+set "RAW_ARGS=%*"
+setlocal EnableDelayedExpansion
+echo !RAW_ARGS! | findstr /i /c:"-NoPause" >nul
 if errorlevel 1 (
     echo.
     pause
 )
+endlocal

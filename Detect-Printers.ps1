@@ -21,6 +21,17 @@ foreach ($req in $RequiredPrinters) {
     }
 }
 
+# Pre-flight check: Verify Print Spooler service is active
+try {
+    $spooler = Get-Service -Name "Spooler" -ErrorAction SilentlyContinue
+    if ($spooler -and $spooler.Status -ne [ServiceProcess.ServiceControllerStatus]::Running) {
+        # Spooler is stopped; printer queries cannot succeed
+        exit 1
+    }
+} catch [System.Exception] {
+    Write-Verbose "Spooler check failed: $($_.Exception.Message)"
+}
+
 $installedPrinters = @()
 
 # Query installed printers via Get-Printer cmdlet

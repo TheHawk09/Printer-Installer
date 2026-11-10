@@ -202,7 +202,7 @@ if ($PrintServer -and $PrintServer -notmatch '^[\\a-zA-Z0-9_\-\.]+$') {
 }
 
 # If PrintServer is directly specified as an IP address, enforce RFC 1918 private address (CWE-200/CWE-300)
-$serverHostPre = $PrintServer.Trim().TrimEnd('\').TrimStart('\')
+$serverHostPre = $PrintServer.Trim().TrimEnd('\').TrimEnd('/').TrimStart('\')
 $parsedServerIp = $null
 if ([System.Net.IPAddress]::TryParse($serverHostPre, [ref]$parsedServerIp)) {
     if (-not (Test-IsPrivateIPAddress $serverHostPre)) {
@@ -350,6 +350,12 @@ function Release-WScriptNetwork {
             Write-Verbose "Could not release WScript.Network COM object: $($_.Exception.Message)"
         } finally {
             $script:wshellNetwork = $null
+            try {
+                [System.GC]::Collect()
+                [System.GC]::WaitForPendingFinalizers()
+            } catch [System.Exception] {
+                Write-Verbose "Garbage collection encountered: $($_.Exception.Message)"
+            }
         }
     }
 }
@@ -475,7 +481,7 @@ function Write-Log {
         }
         Add-Content -LiteralPath $LogPath -Value $logEntry -ErrorAction SilentlyContinue
     } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
-        # Non-fatal log write error
+        Write-Verbose "Non-fatal log write error on ${LogPath}: $($_.Exception.Message)"
     } catch [System.Exception] {
         Write-Verbose "Logging failure to ${LogPath}: $($_.Exception.Message)"
     }
@@ -495,7 +501,7 @@ function Write-Log {
 function Get-FriendlyErrorMessage([string]$rawError) {
     if (-not $rawError) { return "Unknown error occurred" }
 
-    # Common Windows Print Spooler and RPC error patterns
+    # Common Windows Print Spooler, RPC, and WMI error patterns
     switch -Regex ($rawError) {
         "0x80070005|Access is denied|E_ACCESSDENIED|error code:\s*5\b" {
             return "ACCESS DENIED - Windows Point-and-Print policy blocked driver download. Run script with -FixPointAndPrint as Admin."
@@ -508,6 +514,27 @@ function Get-FriendlyErrorMessage([string]$rawError) {
         }
         "0x800706BA|The RPC server is unavailable|error code:\s*1722\b" {
             return "RPC SERVER UNAVAILABLE - The Print Spooler service on the server or client is not responding."
+        }
+        "0x800706BE|The remote procedure call failed" {
+            return "RPC CALL FAILED - The remote print spooler terminated unexpectedly during negotiation."
+        }
+        "0x80070034|The name was not found on the network|error code:\s*52\b" {
+            return "NAME NOT FOUND - Hostname cannot be resolved on local network segment."
+        }
+        "0x8007003A|The specified server cannot perform the requested operation|error code:\s*58\b" {
+            return "SERVER BUSY/UNSUPPORTED - The print server refused or cannot process the connection request."
+        }
+        "0x800704C7|The operation was canceled by the user|error code:\s*1223\b" {
+            return "OPERATION CANCELED - Driver installation prompt was dismissed or canceled by the user."
+        }
+        "0x80041001|Generic failure" {
+            return "WMI GENERIC FAILURE - Windows Management Instrumentation failed to process printer query."
+        }
+        "0x80070006|The handle is invalid|error code:\s*6\b" {
+            return "INVALID HANDLE - Printer device context was closed or invalidated prematurely."
+        }
+        "0x8007007A|The data area passed to a system call is too small|error code:\s*122\b" {
+            return "BUFFER UNDERFLOW - Printer configuration buffer size mismatch."
         }
         "0x80070002|The system cannot find the file specified|error code:\s*2\b" {
             return "DRIVER/FILE NOT FOUND - A required driver package or inf file is missing from the print server."
@@ -844,6 +871,8 @@ if ($FixPointAndPrint) {
 
         Set-SecureRegistryDWord -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0
         Set-SecureRegistryDWord -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1
+        Set-SecureRegistryDWord -Path $policiesPath -Name "NoWarningNoElevationOnInstall" -Value 1
+        Set-SecureRegistryDWord -Path $policiesPath -Name "UpdatePromptSettings" -Value 2
 
         $serverListPath = "$policiesPath\ListofServers"
         if (-not (Test-Path $serverListPath)) {
@@ -1125,6 +1154,8 @@ if ($isAdmin) {
         if (-not (Test-Path $policiesPath)) { New-Item -Path $policiesPath -Force | Out-Null }
         Set-SecureRegistryDWord -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0
         Set-SecureRegistryDWord -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1
+        Set-SecureRegistryDWord -Path $policiesPath -Name "NoWarningNoElevationOnInstall" -Value 1
+        Set-SecureRegistryDWord -Path $policiesPath -Name "UpdatePromptSettings" -Value 2
         $serverListPath = "$policiesPath\ListofServers"
         if (-not (Test-Path $serverListPath)) { New-Item -Path $serverListPath -Force | Out-Null }
         Set-SecureRegistryString -Path $serverListPath -Name $serverHost -Value $serverHost
