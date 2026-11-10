@@ -6,12 +6,14 @@
     Installs, maps, tests, uninstalls, and diagnoses shared network printers.
     Includes:
     - Automatic server resolution with direct IP fallback (172.16.0.32) for custom/NextDNS setups
-    - 4-layer connection redundancy (PrintManagement, WScript.Network COM, WMI, printui.dll)
-    - PrintNightmare / Point-and-Print driver trust fix for Windows 10/11
+    - 4-layer connection redundancy (WMI, Add-PrinterConnection, WScript.Network COM, printui.dll)
+    - Friendly human error translation for common Windows Spooler and RPC error codes
+    - Self-elevation for administrator-required tasks (e.g. -FixPointAndPrint)
+    - Optional interactive menu mode (-Menu)
     - Automated test page printing (/k)
     - Printer discovery and status listing (-ListAvailable, -ListInstalled)
     - Clean uninstallation mode (-Uninstall)
-    - Timestamped persistent file logging
+    - Persistent timestamped file logging with automatic size rotation and -ShowLog
     - Fast pre-flight network diagnostics (DNS, ICMP, SMB port 445)
     - Dynamic box-drawing TUI with auto-scaling width
 
@@ -35,7 +37,13 @@
 
 .PARAMETER FixPointAndPrint
     Applies Point-and-Print server trust in the registry to prevent PrintNightmare / driver block errors.
-    Requires running as Administrator.
+    Automatically self-elevates if not running as Administrator.
+
+.PARAMETER Menu
+    Launches an interactive numbered terminal menu to select operations.
+
+.PARAMETER ShowLog
+    Opens the persistent installer log file directly in the default text editor.
 
 .PARAMETER Uninstall
     Uninstalls/unmaps the specified printers (or all printers from this server) from the user's profile.
@@ -57,6 +65,22 @@
 
 .PARAMETER NoPause
     Suppresses the "Press any key to close..." prompt upon completion.
+
+.EXAMPLE
+    .\Install-Printers.ps1
+    Standard unattended installation of all 3 copiers.
+
+.EXAMPLE
+    .\Install-Printers.ps1 -Menu
+    Launches the interactive menu.
+
+.EXAMPLE
+    .\Install-Printers.ps1 -ShowLog
+    Displays the log file.
+
+.EXAMPLE
+    .\Install-Printers.ps1 -FixPointAndPrint
+    Configures Point-and-Print trust policies (self-elevates via UAC if needed).
 #>
 
 [CmdletBinding(DefaultParameterSetName = "Install")]
@@ -100,6 +124,12 @@ param(
 
     [Parameter(ParameterSetName = "FixPointAndPrint")]
     [switch]$FixPointAndPrint,
+
+    [Parameter(ParameterSetName = "Menu")]
+    [switch]$Menu,
+
+    [Parameter(ParameterSetName = "ShowLog")]
+    [switch]$ShowLog,
 
     [int]$MaxRetries = 1,
     [int]$RetryDelaySeconds = 2,
@@ -156,6 +186,26 @@ function Get-DynamicWidth {
     return [Math]::Min($maxLen, $MaxWidth)
 }
 
+# -------------------------------------------------------------
+# LOGGING & ROTATION ENGINE
+# -------------------------------------------------------------
+$MAX_LOG_SIZE_BYTES = 2MB
+
+function Rotate-LogFileIfNeeded {
+    try {
+        if (Test-Path $LogPath) {
+            $file = Get-Item $LogPath -ErrorAction SilentlyContinue
+            if ($file -and $file.Length -gt $MAX_LOG_SIZE_BYTES) {
+                $archive = "$LogPath.old"
+                if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
+                Rename-Item -Path $LogPath -NewName (Split-Path $archive -Leaf) -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch [System.Exception] {
+        Write-Verbose "Log rotation check encountered: $($_.Exception.Message)"
+    }
+}
+
 function Write-Log {
     param(
         [string]$Message,
@@ -165,6 +215,8 @@ function Write-Log {
     )
     $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     $logEntry = "[$timestamp] $Message"
+
+    Rotate-LogFileIfNeeded
 
     try {
         Add-Content -Path $LogPath -Value $logEntry -ErrorAction SilentlyContinue
@@ -183,6 +235,44 @@ function Write-Log {
     }
 }
 
+# -------------------------------------------------------------
+# FRIENDLY ERROR TRANSLATOR
+# -------------------------------------------------------------
+function Get-FriendlyErrorMessage([string]$rawError) {
+    if (-not $rawError) { return "Unknown error occurred" }
+
+    # Common Windows Print Spooler and RPC error patterns
+    switch -Regex ($rawError) {
+        "0x80070005|Access is denied|E_ACCESSDENIED|error code:\s*5\b" {
+            return "ACCESS DENIED - Windows Point-and-Print policy blocked driver download. Run script with -FixPointAndPrint as Admin."
+        }
+        "0x80070035|The network path was not found|error code:\s*53\b" {
+            return "NETWORK PATH NOT FOUND - Server is offline or inaccessible on this network."
+        }
+        "0x8007007B|The filename, directory name, or volume label syntax is incorrect|error code:\s*123\b" {
+            return "INVALID SHARE SYNTAX - Printer share name is malformed or invalid."
+        }
+        "0x800706BA|The RPC server is unavailable|error code:\s*1722\b" {
+            return "RPC SERVER UNAVAILABLE - The Print Spooler service on the server or client is not responding."
+        }
+        "0x80070002|The system cannot find the file specified|error code:\s*2\b" {
+            return "DRIVER/FILE NOT FOUND - A required driver package or inf file is missing from the print server."
+        }
+        "3012|No printers were found" {
+            return "QUEUE NOT FOUND (3012) - Printer queue does not exist on the specified server share."
+        }
+        "0x80010108|The object invoked has disconnected from its clients" {
+            return "COM TIMEOUT - Windows Script Host or Spooler disconnected during execution."
+        }
+        default {
+            return $rawError
+        }
+    }
+}
+
+# -------------------------------------------------------------
+# TUI VISUAL BUILDERS
+# -------------------------------------------------------------
 function Show-BoxTitle {
     param(
         [string]$Title,
@@ -191,7 +281,6 @@ function Show-BoxTitle {
         [ConsoleColor]$TextColor = [ConsoleColor]::White
     )
     $w = Get-DynamicWidth -Lines (@($Title) + $Lines)
-    # Store global TUI width so all subsequent section headers match the outer banner
     $script:CURRENT_TUI_WIDTH = $w
     $innerW = $w - 2
 
@@ -249,6 +338,19 @@ function Show-NoticeBox {
 }
 
 # -------------------------------------------------------------
+# ACTION: Show-Log Switch
+# -------------------------------------------------------------
+if ($ShowLog) {
+    if (Test-Path $LogPath) {
+        Write-Host "Opening log file: $LogPath" -ForegroundColor Cyan
+        Start-Process notepad.exe -ArgumentList "`"$LogPath`""
+    } else {
+        Write-Host "Log file does not exist yet at: $LogPath" -ForegroundColor Yellow
+    }
+    exit 0
+}
+
+# -------------------------------------------------------------
 # ENVIRONMENT & IDENTITY
 # -------------------------------------------------------------
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -264,6 +366,50 @@ $serverHost = $serverClean.TrimStart('\')
 $ssidName = ((Get-NetConnectionProfile | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue) -join ', ')
 if (-not $ssidName) { $ssidName = "Disconnected / Unknown" }
 
+# -------------------------------------------------------------
+# ACTION: Interactive Menu Mode (-Menu)
+# -------------------------------------------------------------
+if ($Menu) {
+    Clear-Host
+    Show-BoxTitle -Title "NETWORK PRINTER MANAGER - INTERACTIVE MENU" -Lines @(
+        "Server  : $serverClean (Fallback IP: $FallbackIP)",
+        "User    : $env:USERDOMAIN\$env:USERNAME",
+        "Network : $ssidName"
+    ) -BorderColor Cyan -TextColor DarkCyan
+
+    Write-Host ""
+    Write-Host "  === INSTALLATION OPTIONS ===" -ForegroundColor Cyan
+    Write-Host "  [1]  Install All Copiers (L-Kopiator, TB-Kopiator, PB-Kopiator)" -ForegroundColor White
+    Write-Host "  [2]  Install L-Kopiator only" -ForegroundColor White
+    Write-Host "  [3]  Install TB-Kopiator only" -ForegroundColor White
+    Write-Host "  [4]  Install PB-Kopiator only" -ForegroundColor White
+    Write-Host "  [5]  Install All & Print Test Page" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  === MANAGEMENT & TOOLS ===" -ForegroundColor Cyan
+    Write-Host "  [6]  List Installed Network Printers" -ForegroundColor White
+    Write-Host "  [7]  Discover Available Shares on Server" -ForegroundColor White
+    Write-Host "  [8]  Uninstall All Copiers" -ForegroundColor White
+    Write-Host "  [9]  Fix Point-and-Print Driver Policy (Requires Admin)" -ForegroundColor White
+    Write-Host "  [10] Open Diagnostic Log" -ForegroundColor White
+    Write-Host "  [0]  Exit" -ForegroundColor DarkGray
+    Write-Host ""
+    $choice = Read-Host "  Select an option [0-10]"
+
+    switch ($choice) {
+        "1" { & $MyInvocation.MyCommand.Path -NoPause; exit 0 }
+        "2" { & $MyInvocation.MyCommand.Path -Printers @("L-Kopiator") -DefaultPrinter "L-Kopiator" -NoPause; exit 0 }
+        "3" { & $MyInvocation.MyCommand.Path -Printers @("TB-Kopiator") -DefaultPrinter "TB-Kopiator" -NoPause; exit 0 }
+        "4" { & $MyInvocation.MyCommand.Path -Printers @("PB-Kopiator") -DefaultPrinter "PB-Kopiator" -NoPause; exit 0 }
+        "5" { & $MyInvocation.MyCommand.Path -PrintTestPage -NoPause; exit 0 }
+        "6" { & $MyInvocation.MyCommand.Path -ListInstalled -NoPause; exit 0 }
+        "7" { & $MyInvocation.MyCommand.Path -ListAvailable -NoPause; exit 0 }
+        "8" { & $MyInvocation.MyCommand.Path -Uninstall -NoPause; exit 0 }
+        "9" { & $MyInvocation.MyCommand.Path -FixPointAndPrint -NoPause; exit 0 }
+        "10" { & $MyInvocation.MyCommand.Path -ShowLog; exit 0 }
+        default { exit 0 }
+    }
+}
+
 $headerInfo = @(
     "Server    : $serverClean (Fallback IP: $FallbackIP)",
     "User      : $env:USERDOMAIN\$env:USERNAME",
@@ -276,19 +422,42 @@ Write-Log ""
 Show-BoxTitle -Title "ENTERPRISE NETWORK PRINTER MANAGER" -Lines $headerInfo -BorderColor Cyan -TextColor DarkCyan
 
 # -------------------------------------------------------------
-# ACTION: Fix Point-and-Print (PrintNightmare Registry Policy)
+# ACTION: Fix Point-and-Print (Self-Elevating)
 # -------------------------------------------------------------
 if ($FixPointAndPrint) {
     Show-SectionHeader -StepTitle "POLICY CONFIGURATION: POINT-AND-PRINT TRUST" -Color Yellow
+
+    # Self-Elevation: Relaunch with elevation if running as standard user
     if (-not $isAdmin) {
-        Show-NoticeBox -Header "ADMINISTRATIVE PRIVILEGES REQUIRED" -BodyLines @(
-            "Applying Point-and-Print policies requires elevation.",
-            "Please re-launch PowerShell as Administrator with:",
-            "powershell -ExecutionPolicy Bypass -File .\Install-Printers.ps1 -FixPointAndPrint"
-        ) -Color Red
-        exit 1
+        Write-Log "  $($BOX.ARROW) Administrative rights required. Requesting UAC elevation... " -NoNewLine
+        try {
+            $scriptPath = $MyInvocation.MyCommand.Path
+            $process = Start-Process -FilePath "powershell.exe" `
+                -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -FixPointAndPrint -NoPause" `
+                -Verb RunAs -PassThru -Wait
+            if ($process.ExitCode -eq 0) {
+                Write-Log "ELEVATED OK $($BOX.CHECK)" -ForegroundColor Green
+                Show-NoticeBox -Header "ELEVATED CONFIGURATION COMPLETE" -BodyLines @(
+                    "Point-and-Print registry policies were applied successfully in elevated session."
+                ) -Color Green
+            } else {
+                Write-Log "FAILED ($($process.ExitCode)) $($BOX.CROSS)" -ForegroundColor Red
+            }
+        } catch [System.Exception] {
+            Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Red
+            Show-NoticeBox -Header "ELEVATION CANCELLED OR BLOCKED" -BodyLines @(
+                "UAC prompt was denied or could not be initiated: $($_.Exception.Message)"
+            ) -Color Red
+        }
+
+        if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
+            Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        exit 0
     }
 
+    # Running Elevated - Apply Policies
     try {
         $policiesPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
         if (-not (Test-Path $policiesPath)) {
@@ -473,7 +642,6 @@ if ($Uninstall) {
     $uninstalledCount = 0
     foreach ($printer in $Printers) {
         $printerClean = $printer.Trim().TrimStart('\')
-        # Try both server names and IP formats
         $possiblePaths = @(
             "$serverClean\$printerClean",
             "\\$FallbackIP\$printerClean"
@@ -508,7 +676,7 @@ if ($Uninstall) {
 
 # Step 1: Spooler Health Diagnostic
 Show-SectionHeader -StepTitle "STEP 1/4: LOCAL PRINT SPOOLER DIAGNOSTIC" -Color Cyan
-Write-Log "  $($BOX.ARROW) Spooler Service Status: " -NoNewLine
+Write-Log "  $($BOX.ARROW) Spooler Service Status : " -NoNewLine
 try {
     $spoolerService = Get-Service -Name "Spooler" -ErrorAction Stop
     if ($spoolerService.Status -eq [ServiceProcess.ServiceControllerStatus]::Running) {
@@ -531,7 +699,6 @@ try {
 # Step 2: Network & Server Reachability
 Show-SectionHeader -StepTitle "STEP 2/4: NETWORK & SERVER REACHABILITY" -Color Cyan
 
-# 2a. Primary DNS Resolution
 Write-Log "  $($BOX.ARROW) DNS Host Resolution   : " -NoNewLine
 $activeServer = ""
 $resolvedIPs = @()
@@ -628,7 +795,7 @@ Show-SectionHeader -StepTitle "STEP 3/4: INSTALLING & MAPPING PRINTERS" -Color C
 function Connect-PrinterSafe([string]$printerPath) {
     $errors = @{}
 
-    # Engine 1: WMI Win32_Printer Method (Highest reliability across IP & FQDN shares)
+    # Engine 1: WMI Win32_Printer Method
     try {
         $wmiPrinterClass = [wmiclass]"Win32_Printer"
         $result = $wmiPrinterClass.AddPrinterConnection($printerPath)
@@ -718,7 +885,6 @@ $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 foreach ($printer in $Printers) {
     $printerClean = $printer.Trim().TrimStart('\')
     
-    # Try primary target (FQDN or resolved server), with fallback to direct IP if different
     $candidatePaths = @("$activeServer\$printerClean")
     if ($FallbackIP -and $activeServer -ne "\\$FallbackIP") {
         $candidatePaths += "\\$FallbackIP\$printerClean"
@@ -795,8 +961,13 @@ foreach ($printer in $Printers) {
         })
     } else {
         Write-Log "    Status : FAILED $($BOX.CROSS)" -ForegroundColor Red
+        
+        $translatedErrors = @()
         foreach ($key in $attemptErrors.Keys) {
-            Write-Log "    Details: $key -> $($attemptErrors[$key])" -ForegroundColor Red
+            $rawMsg = $attemptErrors[$key]
+            $friendlyMsg = Get-FriendlyErrorMessage -rawError $rawMsg
+            Write-Log "    Details: $key -> $friendlyMsg" -ForegroundColor Red
+            $translatedErrors += "${key}: $friendlyMsg"
         }
 
         $results.Add([PSCustomObject]@{
@@ -806,7 +977,7 @@ foreach ($printer in $Printers) {
             Engine    = "None"
             IsDefault = $false
             TestPage  = $false
-            Error     = ($attemptErrors.Values -join " | ")
+            Error     = ($translatedErrors -join " | ")
         })
     }
 }
