@@ -4,11 +4,17 @@
 
 .DESCRIPTION
     Installs, maps, tests, uninstalls, and diagnoses shared network printers.
+    Built for Intune / Company Portal automated deployment, standalone execution,
+    and administrative IT troubleshooting.
     Includes:
     - Automatic server resolution with direct IP fallback (172.16.0.32) for custom/NextDNS setups
     - 4-layer connection redundancy (WMI, Add-PrinterConnection, WScript.Network COM, printui.dll)
     - Friendly human error translation for common Windows Spooler and RPC error codes
-    - Self-elevation for administrator-required tasks (e.g. -FixPointAndPrint)
+    - Self-elevation for administrator-required tasks (e.g. -FixPointAndPrint, -RestartSpooler)
+    - Print queue flusher and Spooler restarter (-RestartSpooler)
+    - Windows Printers & Scanners settings launcher (-OpenSettings)
+    - Execution stopwatch / duration benchmark
+    - Auto-detect GTG Wi-Fi with interactive retry loop for terminal users
     - Optional interactive menu mode (-Menu)
     - Automated test page printing (/k)
     - Printer discovery and status listing (-ListAvailable, -ListInstalled)
@@ -39,6 +45,13 @@
     Applies Point-and-Print server trust in the registry to prevent PrintNightmare / driver block errors.
     Automatically self-elevates if not running as Administrator.
 
+.PARAMETER RestartSpooler
+    Flushes stuck print jobs from spool directory and restarts the Print Spooler service.
+    Automatically self-elevates if not running as Administrator.
+
+.PARAMETER OpenSettings
+    Opens the Windows Printers & Scanners Settings page (ms-settings:printers).
+
 .PARAMETER Menu
     Launches an interactive numbered terminal menu to select operations.
 
@@ -64,7 +77,7 @@
     Bypasses pre-flight network reachability guards.
 
 .PARAMETER NoPause
-    Suppresses the "Press any key to close..." prompt upon completion.
+    Suppresses the "Press any key to close..." prompt upon completion (automatic in non-interactive/Intune runs).
 
 .EXAMPLE
     .\Install-Printers.ps1
@@ -81,6 +94,14 @@
 .EXAMPLE
     .\Install-Printers.ps1 -FixPointAndPrint
     Configures Point-and-Print trust policies (self-elevates via UAC if needed).
+
+.EXAMPLE
+    .\Install-Printers.ps1 -RestartSpooler
+    Flushes stuck spool files and restarts the Print Spooler service.
+
+.EXAMPLE
+    .\Install-Printers.ps1 -Uninstall
+    Uninstalls all 3 GTG network copiers.
 #>
 
 [CmdletBinding(DefaultParameterSetName = "Install")]
@@ -125,6 +146,12 @@ param(
     [Parameter(ParameterSetName = "FixPointAndPrint")]
     [switch]$FixPointAndPrint,
 
+    [Parameter(ParameterSetName = "RestartSpooler")]
+    [switch]$RestartSpooler,
+
+    [Parameter(ParameterSetName = "OpenSettings")]
+    [switch]$OpenSettings,
+
     [Parameter(ParameterSetName = "Menu")]
     [switch]$Menu,
 
@@ -136,6 +163,9 @@ param(
     [string]$LogPath = "$env:TEMP\PrinterInstaller.log",
     [switch]$NoPause
 )
+
+# Start execution stopwatch for performance telemetry
+$scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -351,6 +381,15 @@ if ($ShowLog) {
 }
 
 # -------------------------------------------------------------
+# ACTION: Open Windows Printer Settings
+# -------------------------------------------------------------
+if ($OpenSettings) {
+    Write-Host "Opening Windows Printers & Scanners Settings..." -ForegroundColor Cyan
+    Start-Process "ms-settings:printers"
+    exit 0
+}
+
+# -------------------------------------------------------------
 # ENVIRONMENT & IDENTITY
 # -------------------------------------------------------------
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -363,8 +402,78 @@ if (-not $serverClean.StartsWith("\\")) {
 }
 $serverHost = $serverClean.TrimStart('\')
 
-$ssidName = ((Get-NetConnectionProfile | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue) -join ', ')
-if (-not $ssidName) { $ssidName = "Disconnected / Unknown" }
+function Get-ActiveSSID {
+    $name = ((Get-NetConnectionProfile | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue) -join ', ')
+    if (-not $name) { return "Disconnected / Unknown" }
+    return $name
+}
+
+# -------------------------------------------------------------
+# ACTION: Restart Print Spooler & Flush Stuck Jobs
+# -------------------------------------------------------------
+if ($RestartSpooler) {
+    Show-SectionHeader -StepTitle "SERVICE MAINTENANCE: FLUSH & RESTART PRINT SPOOLER" -Color Yellow
+
+    if (-not $isAdmin) {
+        Write-Log "  $($BOX.ARROW) Administrative rights required. Requesting UAC elevation... " -NoNewLine
+        try {
+            $scriptPath = $MyInvocation.MyCommand.Path
+            $process = Start-Process -FilePath "powershell.exe" `
+                -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -RestartSpooler -NoPause" `
+                -Verb RunAs -PassThru -Wait
+            if ($process.ExitCode -eq 0) {
+                Write-Log "ELEVATED OK $($BOX.CHECK)" -ForegroundColor Green
+            } else {
+                Write-Log "FAILED ($($process.ExitCode)) $($BOX.CROSS)" -ForegroundColor Red
+            }
+        } catch [System.Exception] {
+            Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Red
+        }
+
+        if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
+            Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        exit 0
+    }
+
+    # Running elevated: Stop spooler, purge spool dir, start spooler
+    Write-Log "  $($BOX.ARROW) Stopping Print Spooler service... " -NoNewLine
+    try {
+        Stop-Service -Name "Spooler" -Force -ErrorAction Stop
+        Write-Log "STOPPED $($BOX.CHECK)" -ForegroundColor Green
+    } catch [System.Exception] {
+        Write-Log "FAILED ($($_.Exception.Message)) $($BOX.CROSS)" -ForegroundColor Red
+    }
+
+    Write-Log "  $($BOX.ARROW) Purging stuck print jobs from spool directory... " -NoNewLine
+    try {
+        $spoolDir = "$env:SystemRoot\System32\spool\PRINTERS"
+        if (Test-Path $spoolDir) {
+            Get-ChildItem -Path $spoolDir -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log "CLEARED $($BOX.CHECK)" -ForegroundColor Green
+    } catch [System.Exception] {
+        Write-Log "SKIPPED ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+
+    Write-Log "  $($BOX.ARROW) Restarting Print Spooler service... " -NoNewLine
+    try {
+        Start-Service -Name "Spooler" -ErrorAction Stop
+        Write-Log "RUNNING $($BOX.CHECK)" -ForegroundColor Green
+        Show-NoticeBox -Header "PRINT SPOOLER RESET COMPLETE" -BodyLines @(
+            "Print Spooler service was successfully restarted and stuck queues were cleared."
+        ) -Color Green
+    } catch [System.Exception] {
+        Write-Log "FAILED ($($_.Exception.Message)) $($BOX.CROSS)" -ForegroundColor Red
+    }
+
+    if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
+        Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    exit 0
+}
 
 # -------------------------------------------------------------
 # ACTION: Interactive Menu Mode (-Menu)
@@ -374,7 +483,7 @@ if ($Menu) {
     Show-BoxTitle -Title "NETWORK PRINTER MANAGER - INTERACTIVE MENU" -Lines @(
         "Server  : $serverClean (Fallback IP: $FallbackIP)",
         "User    : $env:USERDOMAIN\$env:USERNAME",
-        "Network : $ssidName"
+        "Network : $(Get-ActiveSSID)"
     ) -BorderColor Cyan -TextColor DarkCyan
 
     Write-Host ""
@@ -389,23 +498,27 @@ if ($Menu) {
     Write-Host "  [6]  List Installed Network Printers" -ForegroundColor White
     Write-Host "  [7]  Discover Available Shares on Server" -ForegroundColor White
     Write-Host "  [8]  Uninstall All Copiers" -ForegroundColor White
-    Write-Host "  [9]  Fix Point-and-Print Driver Policy (Requires Admin)" -ForegroundColor White
-    Write-Host "  [10] Open Diagnostic Log" -ForegroundColor White
+    Write-Host "  [9]  Flush Queue & Restart Print Spooler (Requires Admin)" -ForegroundColor White
+    Write-Host "  [10] Fix Point-and-Print Driver Policy (Requires Admin)" -ForegroundColor White
+    Write-Host "  [11] Open Windows Printers & Scanners Settings" -ForegroundColor White
+    Write-Host "  [12] Open Diagnostic Log" -ForegroundColor White
     Write-Host "  [0]  Exit" -ForegroundColor DarkGray
     Write-Host ""
-    $choice = Read-Host "  Select an option [0-10]"
+    $choice = Read-Host "  Select an option [0-12]"
 
     switch ($choice) {
-        "1" { & $MyInvocation.MyCommand.Path -NoPause; exit 0 }
-        "2" { & $MyInvocation.MyCommand.Path -Printers @("L-Kopiator") -DefaultPrinter "L-Kopiator" -NoPause; exit 0 }
-        "3" { & $MyInvocation.MyCommand.Path -Printers @("TB-Kopiator") -DefaultPrinter "TB-Kopiator" -NoPause; exit 0 }
-        "4" { & $MyInvocation.MyCommand.Path -Printers @("PB-Kopiator") -DefaultPrinter "PB-Kopiator" -NoPause; exit 0 }
-        "5" { & $MyInvocation.MyCommand.Path -PrintTestPage -NoPause; exit 0 }
-        "6" { & $MyInvocation.MyCommand.Path -ListInstalled -NoPause; exit 0 }
-        "7" { & $MyInvocation.MyCommand.Path -ListAvailable -NoPause; exit 0 }
-        "8" { & $MyInvocation.MyCommand.Path -Uninstall -NoPause; exit 0 }
-        "9" { & $MyInvocation.MyCommand.Path -FixPointAndPrint -NoPause; exit 0 }
-        "10" { & $MyInvocation.MyCommand.Path -ShowLog; exit 0 }
+        "1"  { & $MyInvocation.MyCommand.Path -NoPause; exit 0 }
+        "2"  { & $MyInvocation.MyCommand.Path -Printers @("L-Kopiator") -DefaultPrinter "L-Kopiator" -NoPause; exit 0 }
+        "3"  { & $MyInvocation.MyCommand.Path -Printers @("TB-Kopiator") -DefaultPrinter "TB-Kopiator" -NoPause; exit 0 }
+        "4"  { & $MyInvocation.MyCommand.Path -Printers @("PB-Kopiator") -DefaultPrinter "PB-Kopiator" -NoPause; exit 0 }
+        "5"  { & $MyInvocation.MyCommand.Path -PrintTestPage -NoPause; exit 0 }
+        "6"  { & $MyInvocation.MyCommand.Path -ListInstalled -NoPause; exit 0 }
+        "7"  { & $MyInvocation.MyCommand.Path -ListAvailable -NoPause; exit 0 }
+        "8"  { & $MyInvocation.MyCommand.Path -Uninstall -NoPause; exit 0 }
+        "9"  { & $MyInvocation.MyCommand.Path -RestartSpooler -NoPause; exit 0 }
+        "10" { & $MyInvocation.MyCommand.Path -FixPointAndPrint -NoPause; exit 0 }
+        "11" { & $MyInvocation.MyCommand.Path -OpenSettings; exit 0 }
+        "12" { & $MyInvocation.MyCommand.Path -ShowLog; exit 0 }
         default { exit 0 }
     }
 }
@@ -414,7 +527,7 @@ $headerInfo = @(
     "Server    : $serverClean (Fallback IP: $FallbackIP)",
     "User      : $env:USERDOMAIN\$env:USERNAME",
     "Privilege : $(if ($isAdmin) { 'Administrator (Elevated)' } else { 'Standard User' })",
-    "Network   : $ssidName",
+    "Network   : $(Get-ActiveSSID)",
     "Log File  : $LogPath"
 )
 
@@ -660,7 +773,8 @@ if ($Uninstall) {
     }
 
     Show-NoticeBox -Header "UNINSTALLATION COMPLETE" -BodyLines @(
-        "Successfully removed $uninstalledCount printer connection(s)."
+        "Successfully removed $uninstalledCount printer connection(s).",
+        "Elapsed Time: $($scriptStopwatch.Elapsed.TotalSeconds.ToString('F1')) seconds"
     ) -Color Green
 
     if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
@@ -674,19 +788,41 @@ if ($Uninstall) {
 # ACTION: Install Printers (Default Flow)
 # -------------------------------------------------------------
 
-# Step 1: Spooler Health Diagnostic
-Show-SectionHeader -StepTitle "STEP 1/4: LOCAL PRINT SPOOLER DIAGNOSTIC" -Color Cyan
+# Step 1: Automated Self-Healing & Spooler Health Diagnostic
+Show-SectionHeader -StepTitle "STEP 1/4: LOCAL PRINT SPOOLER HEALTH & CLEANUP" -Color Cyan
+
+# 1a. If running with admin privileges, ensure Point-and-Print policy is automatically configured
+if ($isAdmin) {
+    try {
+        $policiesPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+        if (-not (Test-Path $policiesPath)) { New-Item -Path $policiesPath -Force | Out-Null }
+        Set-ItemProperty -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        $serverListPath = "$policiesPath\ListofServers"
+        if (-not (Test-Path $serverListPath)) { New-Item -Path $serverListPath -Force | Out-Null }
+        Set-ItemProperty -Path $serverListPath -Name $serverHost -Value $serverHost -Type String -Force -ErrorAction SilentlyContinue
+        if ($FallbackIP) { Set-ItemProperty -Path $serverListPath -Name $FallbackIP -Value $FallbackIP -Type String -Force -ErrorAction SilentlyContinue }
+        Write-Verbose "Automated Point-and-Print policy verification: Applied"
+    } catch [System.Exception] {
+        Write-Verbose "Automated Point-and-Print policy check encountered: $($_.Exception.Message)"
+    }
+}
+
+# 1b. Check local Print Spooler service status and auto-recover
 Write-Log "  $($BOX.ARROW) Spooler Service Status : " -NoNewLine
+$spoolerOk = $false
 try {
     $spoolerService = Get-Service -Name "Spooler" -ErrorAction Stop
     if ($spoolerService.Status -eq [ServiceProcess.ServiceControllerStatus]::Running) {
         Write-Log "RUNNING $($BOX.CHECK)" -ForegroundColor Green
+        $spoolerOk = $true
     } else {
         Write-Log "STOPPED ($($spoolerService.Status))" -ForegroundColor Yellow
-        Write-Log "  $($BOX.ARROW) Attempting to start Print Spooler... " -NoNewLine
+        Write-Log "  $($BOX.ARROW) Auto-recovering Print Spooler... " -NoNewLine
         try {
             Start-Service -Name "Spooler" -ErrorAction Stop
             Write-Log "STARTED $($BOX.CHECK)" -ForegroundColor Green
+            $spoolerOk = $true
         } catch [System.Exception] {
             Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Red
             Write-Log "    Note: Starting the spooler requires Administrator rights: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -696,97 +832,142 @@ try {
     Write-Log "WARNING (Could not query service: $($_.Exception.Message))" -ForegroundColor Yellow
 }
 
-# Step 2: Network & Server Reachability
+# 1c. Clear corrupted stuck spooler files if elevated
+if ($isAdmin -and $spoolerOk) {
+    try {
+        $spoolDir = "$env:SystemRoot\System32\spool\PRINTERS"
+        if (Test-Path $spoolDir) {
+            $stuckFiles = Get-ChildItem -Path $spoolDir -Force -ErrorAction SilentlyContinue
+            if ($stuckFiles.Count -gt 0) {
+                Write-Log "  $($BOX.ARROW) Flushing $($stuckFiles.Count) stale spool files... " -NoNewLine
+                Stop-Service -Name "Spooler" -Force -ErrorAction SilentlyContinue
+                $stuckFiles | Remove-Item -Force -ErrorAction SilentlyContinue
+                Start-Service -Name "Spooler" -ErrorAction SilentlyContinue
+                Write-Log "CLEARED $($BOX.CHECK)" -ForegroundColor Green
+            }
+        }
+    } catch [System.Exception] {
+        Write-Verbose "Automated spool flush skipped: $($_.Exception.Message)"
+    }
+}
+
+# Step 2: Network & Server Reachability with Interactive Retry Loop
 Show-SectionHeader -StepTitle "STEP 2/4: NETWORK & SERVER REACHABILITY" -Color Cyan
 
-Write-Log "  $($BOX.ARROW) DNS Host Resolution   : " -NoNewLine
-$activeServer = ""
-$resolvedIPs = @()
+$networkLoopActive = $true
 
-try {
-    $dnsTask = [System.Net.Dns]::GetHostAddressesAsync($serverHost)
-    if ($dnsTask.Wait(2000)) {
-        $resolvedIPs = $dnsTask.Result | ForEach-Object { $_.IPAddressToString }
-        Write-Log "OK ($($resolvedIPs -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
-        $activeServer = $serverClean
-    } else {
+while ($networkLoopActive) {
+    Write-Log "  $($BOX.ARROW) DNS Host Resolution   : " -NoNewLine
+    $activeServer = ""
+    $resolvedIPs = @()
+
+    try {
+        $dnsTask = [System.Net.Dns]::GetHostAddressesAsync($serverHost)
+        if ($dnsTask.Wait(2000)) {
+            $resolvedIPs = $dnsTask.Result | ForEach-Object { $_.IPAddressToString }
+            Write-Log "OK ($($resolvedIPs -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
+            $activeServer = $serverClean
+        } else {
+            Write-Log "PRIMARY DNS UNRESOLVED" -ForegroundColor Yellow
+        }
+    } catch [System.Exception] {
         Write-Log "PRIMARY DNS UNRESOLVED" -ForegroundColor Yellow
     }
-} catch [System.Exception] {
-    Write-Log "PRIMARY DNS UNRESOLVED" -ForegroundColor Yellow
-}
 
-# 2b. Secondary DNS Check against Internal Domain Controllers (172.16.0.7 / 172.16.0.8)
-$resolvedInternalIP = ""
-if ($resolvedIPs.Count -eq 0) {
-    Write-Log "  $($BOX.ARROW) Querying Internal DNS : " -NoNewLine
-    foreach ($dc in $InternalDNSServers) {
-        try {
-            $internalDnsRes = Resolve-DnsName -Name $serverHost -Server $dc -QuickTimeout -ErrorAction Stop
-            if ($internalDnsRes) {
-                $ips = @($internalDnsRes | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress)
-                if ($ips.Count -gt 0) {
-                    $resolvedInternalIP = $ips[0]
-                    Write-Log "RESOLVED via $dc ($($ips -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
-                    break
+    # 2b. Secondary DNS Check against Internal Domain Controllers
+    $resolvedInternalIP = ""
+    if ($resolvedIPs.Count -eq 0) {
+        Write-Log "  $($BOX.ARROW) Querying Internal DNS : " -NoNewLine
+        foreach ($dc in $InternalDNSServers) {
+            try {
+                $internalDnsRes = Resolve-DnsName -Name $serverHost -Server $dc -QuickTimeout -ErrorAction Stop
+                if ($internalDnsRes) {
+                    $ips = @($internalDnsRes | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress)
+                    if ($ips.Count -gt 0) {
+                        $resolvedInternalIP = $ips[0]
+                        Write-Log "RESOLVED via $dc ($($ips -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
+                        break
+                    }
                 }
+            } catch [System.Exception] {
+                Write-Verbose "Internal DNS query to $dc failed: $($_.Exception.Message)"
             }
-        } catch [System.Exception] {
-            Write-Verbose "Internal DNS query to $dc failed: $($_.Exception.Message)"
+        }
+        if (-not $resolvedInternalIP) {
+            Write-Log "NOT DIRECTLY RESOLVABLE (Custom DNS / DoH active)" -ForegroundColor Yellow
         }
     }
-    if (-not $resolvedInternalIP) {
-        Write-Log "NOT DIRECTLY RESOLVABLE (Custom DNS / DoH active)" -ForegroundColor Yellow
+
+    # 2c. Target selection: If primary DNS cannot resolve the FQDN in Windows, target the IP directly
+    if (-not $activeServer) {
+        $ipTarget = if ($resolvedInternalIP) { $resolvedInternalIP } else { $FallbackIP }
+        Write-Log "  $($BOX.ARROW) Direct Server Target  : USING IP DIRECTLY ($ipTarget) $($BOX.CHECK)" -ForegroundColor Cyan
+        $activeServer = "\\$ipTarget"
     }
-}
 
-# 2c. Target selection: If primary DNS cannot resolve the FQDN in Windows, target the IP directly
-if (-not $activeServer) {
-    $ipTarget = if ($resolvedInternalIP) { $resolvedInternalIP } else { $FallbackIP }
-    Write-Log "  $($BOX.ARROW) Direct Server Target  : USING IP DIRECTLY ($ipTarget) $($BOX.CHECK)" -ForegroundColor Cyan
-    $activeServer = "\\$ipTarget"
-}
+    # 2d. SMB Port 445 Handshake
+    $targetHostForSMB = $activeServer.TrimStart('\')
+    Write-Log "  $($BOX.ARROW) Port 445 (SMB) Check  : " -NoNewLine
+    $tcpClient = New-Object System.Net.Sockets.TcpClient
+    $smbReachable = $false
+    try {
+        $connectTask = $tcpClient.ConnectAsync($targetHostForSMB, 445)
+        if ($connectTask.Wait(2500)) {
+            $smbReachable = $true
+            Write-Log "OPEN on $targetHostForSMB $($BOX.CHECK)" -ForegroundColor Green
+        } else {
+            Write-Log "TIMEOUT ($targetHostForSMB:445 unreachable) $($BOX.CROSS)" -ForegroundColor Yellow
+        }
+    } catch [System.Exception] {
+        $errMsg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        Write-Log "UNREACHABLE ($errMsg) $($BOX.CROSS)" -ForegroundColor Yellow
+    } finally {
+        $tcpClient.Close()
+        $tcpClient.Dispose()
+    }
 
-# 2d. SMB Port 445 Handshake
-$targetHostForSMB = $activeServer.TrimStart('\')
-Write-Log "  $($BOX.ARROW) Port 445 (SMB) Check  : " -NoNewLine
-$tcpClient = New-Object System.Net.Sockets.TcpClient
-$smbReachable = $false
-try {
-    $connectTask = $tcpClient.ConnectAsync($targetHostForSMB, 445)
-    if ($connectTask.Wait(2500)) {
-        $smbReachable = $true
-        Write-Log "OPEN on $targetHostForSMB $($BOX.CHECK)" -ForegroundColor Green
+    if ($smbReachable -or $ForceInstall) {
+        $networkLoopActive = $false
     } else {
-        Write-Log "TIMEOUT ($targetHostForSMB:445 unreachable) $($BOX.CROSS)" -ForegroundColor Yellow
-    }
-} catch [System.Exception] {
-    $errMsg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-    Write-Log "UNREACHABLE ($errMsg) $($BOX.CROSS)" -ForegroundColor Yellow
-} finally {
-    $tcpClient.Close()
-    $tcpClient.Dispose()
-}
+        # Check if running interactively in a console vs automated background (Intune / Company Portal)
+        $isInteractiveConsole = ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive)
 
-if (-not $smbReachable -and -not $ForceInstall) {
-    Show-NoticeBox -Header "CONNECTION BLOCKED: SERVER UNREACHABLE" -BodyLines @(
-        "Cannot reach print server '$targetHostForSMB' on Port 445 (SMB).",
-        "",
-        "DIAGNOSTICS:",
-        " * Active Network SSID : $ssidName",
-        " * Target Server       : $activeServer",
-        " * SMB Port 445        : BLOCKED / Unreachable",
-        "",
-        "REASON & SOLUTION:",
-        " Ensure you are connected to the school network (GTC Student/Staff).",
-        " (To attempt installation anyway, re-run with: .\Install-Printers.ps1 -ForceInstall)"
-    ) -Color Red
+        if ($isInteractiveConsole -and -not $NoPause) {
+            Show-NoticeBox -Header "NETWORK NOT REACHABLE: RETRY?" -BodyLines @(
+                "Cannot reach print server '$targetHostForSMB' on Port 445 (SMB).",
+                "Current SSID: $(Get-ActiveSSID)",
+                "",
+                "Please connect to the GTG school Wi-Fi (GTC Student / Staff) or VPN.",
+                "Press [R] to retry connection, or [Enter / Q] to exit."
+            ) -Color Yellow
 
-    if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
-        Write-Host "`nPress any key to exit..." -ForegroundColor DarkGray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            Write-Host "`n  Action: [R] Retry  |  [Any Other Key] Exit : " -ForegroundColor Cyan -NoNewline
+            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            Write-Host ""
+            if ($key.Character -eq 'r' -or $key.Character -eq 'R') {
+                Write-Host "`nRefreshing network interfaces and retrying...`n" -ForegroundColor Cyan
+                Start-Sleep -Seconds 1
+                continue
+            } else {
+                exit 2
+            }
+        } else {
+            # Non-interactive / Company Portal mode: log diagnostic and exit immediately with exit code 2
+            Show-NoticeBox -Header "CONNECTION BLOCKED: SERVER UNREACHABLE" -BodyLines @(
+                "Cannot reach print server '$targetHostForSMB' on Port 445 (SMB).",
+                "",
+                "DIAGNOSTICS:",
+                " * Active Network SSID : $(Get-ActiveSSID)",
+                " * Target Server       : $activeServer",
+                " * SMB Port 445        : BLOCKED / Unreachable",
+                "",
+                "REASON & SOLUTION:",
+                " Device must be connected to the GTG school network (GTC Student/Staff).",
+                " (To attempt installation anyway, re-run with: .\Install-Printers.ps1 -ForceInstall)"
+            ) -Color Red
+            exit 2
+        }
     }
-    exit 2
 }
 
 # Step 3: Multi-layer Connection Engines
@@ -987,6 +1168,7 @@ Show-SectionHeader -StepTitle "STEP 4/4: FINAL INSTALLATION SUMMARY" -Color Cyan
 
 $successCount = ($results | Where-Object { $_.Status -eq "Connected" }).Count
 $failCount = ($results | Where-Object { $_.Status -eq "Failed" }).Count
+$elapsedSeconds = $scriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
 
 $summaryLines = @()
 foreach ($r in $results) {
@@ -996,7 +1178,7 @@ foreach ($r in $results) {
     $summaryLines += ("$mark  {0,-14} : {1}{2}{3} ({4})" -f $r.Printer, $r.Status, $defaultMark, $testMark, $r.Engine)
 }
 $summaryLines += ""
-$summaryLines += "Total: $($results.Count)  |  Succeeded: $successCount  |  Failed: $failCount"
+$summaryLines += "Total: $($results.Count)  |  Succeeded: $successCount  |  Failed: $failCount  |  Duration: ${elapsedSeconds}s"
 $summaryLines += "Log Saved to: $LogPath"
 
 $summaryColor = if ($failCount -gt 0) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
