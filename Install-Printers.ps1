@@ -68,7 +68,7 @@
     Queries the print server to list all publicly visible shared printers.
 
 .PARAMETER LogPath
-    Path to write a persistent diagnostic log file. Default: "$env:TEMP\PrinterInstaller.log".
+    Path to write a persistent diagnostic log file. Default: "$env:LOCALAPPDATA\GTG-Printers\PrinterInstaller.log".
 
 .PARAMETER RemoveExisting
     Removes existing printer connections matching the given names before reconnecting.
@@ -160,12 +160,199 @@ param(
 
     [int]$MaxRetries = 1,
     [int]$RetryDelaySeconds = 2,
-    [string]$LogPath = "$env:TEMP\PrinterInstaller.log",
+    [string]$LogPath = "",
     [switch]$NoPause
 )
 
 # Start execution stopwatch for performance telemetry
 $scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# -------------------------------------------------------------
+# PRE-FLIGHT INPUT VALIDATION & SECURITY HARDENING (CWE-20)
+# -------------------------------------------------------------
+function Test-IsPrivateIPAddress([string]$ipStr) {
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($ipStr, [ref]$ip)) { return $false }
+    if ([System.Net.IPAddress]::IsLoopback($ip)) { return $true }
+    $bytes = $ip.GetAddressBytes()
+    if ($bytes.Length -ne 4) { return $false } # IPv4 only
+    # RFC 1918 private ranges & APIPA (CWE-200/CWE-300 NetNTLM theft prevention)
+    if ($bytes[0] -eq 10) { return $true }
+    if ($bytes[0] -eq 172 -and ($bytes[1] -ge 16 -and $bytes[1] -le 31)) { return $true }
+    if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $true }
+    if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $true }
+    return $false
+}
+
+function Test-IsLocalFixedDrivePath([string]$filePath) {
+    try {
+        if (-not $filePath -or $filePath.StartsWith("\\")) { return $false }
+        $root = [System.IO.Path]::GetPathRoot($filePath)
+        if (-not $root -or $root.StartsWith("\\")) { return $false }
+        $drive = [System.IO.DriveInfo]::new($root)
+        return ($drive.DriveType -eq [System.IO.DriveType]::Fixed)
+    } catch [System.Exception] {
+        return $false
+    }
+}
+
+if ($PrintServer -and $PrintServer -notmatch '^[\\a-zA-Z0-9_\-\.]+$') {
+    Write-Error "Invalid characters in -PrintServer parameter: '$PrintServer'."
+    exit 1
+}
+
+# If PrintServer is directly specified as an IP address, enforce RFC 1918 private address (CWE-200/CWE-300)
+$serverHostPre = $PrintServer.Trim().TrimEnd('\').TrimStart('\')
+$parsedServerIp = $null
+if ([System.Net.IPAddress]::TryParse($serverHostPre, [ref]$parsedServerIp)) {
+    if (-not (Test-IsPrivateIPAddress $serverHostPre)) {
+        Write-Error "Security Policy Violation (CWE-200/CWE-300): -PrintServer IP '$serverHostPre' is a public IP. Print server targets must belong to private internal subnets (RFC 1918)."
+        exit 1
+    }
+}
+
+if ($FallbackIP) {
+    if ($FallbackIP -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+        Write-Error "Invalid IP address format in -FallbackIP parameter: '$FallbackIP'."
+        exit 1
+    }
+    if (-not (Test-IsPrivateIPAddress $FallbackIP)) {
+        Write-Error "Security Policy Violation (CWE-200/CWE-300): -FallbackIP '$FallbackIP' is a public IP address. Print server targets must belong to private internal subnets (RFC 1918)."
+        exit 1
+    }
+}
+
+foreach ($dns in $InternalDNSServers) {
+    if ($dns -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+        Write-Error "Invalid IP address format in -InternalDNSServers parameter: '$dns'."
+        exit 1
+    }
+    if (-not (Test-IsPrivateIPAddress $dns)) {
+        Write-Error "Security Policy Violation (CWE-200/CWE-300): Internal DNS server '$dns' must belong to private internal subnets (RFC 1918)."
+        exit 1
+    }
+}
+
+foreach ($p in $Printers) {
+    if ($p -notmatch '^[a-zA-Z0-9_\-\.\s\\]+$') {
+        Write-Error "Invalid characters in printer name: '$p'."
+        exit 1
+    }
+}
+if ($DefaultPrinter -and $DefaultPrinter -notmatch '^[a-zA-Z0-9_\-\.\s\\]+$') {
+    Write-Error "Invalid characters in -DefaultPrinter parameter: '$DefaultPrinter'."
+    exit 1
+}
+
+# Pin canonical system paths against search path vulnerabilities (CWE-426/CWE-427)
+$script:SYSTEM32 = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)
+if (-not $script:SYSTEM32 -or -not (Test-Path $script:SYSTEM32)) { $script:SYSTEM32 = "$env:SystemRoot\System32" }
+$script:RUNDLL32_EXE = Join-Path $script:SYSTEM32 "rundll32.exe"
+$script:NET_EXE = Join-Path $script:SYSTEM32 "net.exe"
+$script:NOTEPAD_EXE = Join-Path $script:SYSTEM32 "notepad.exe"
+$script:POWERSHELL_EXE = Join-Path $script:SYSTEM32 "WindowsPowerShell\v1.0\powershell.exe"
+
+# Securely pin LocalAppData directory and harden NTFS ACLs (CWE-377/CWE-732)
+$secureLocalAppDir = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+if (-not $secureLocalAppDir -or -not (Test-Path $secureLocalAppDir)) {
+    $secureLocalAppDir = if ($env:LOCALAPPDATA -and (Test-Path $env:LOCALAPPDATA)) {
+        $env:LOCALAPPDATA
+    } elseif ($env:USERPROFILE) {
+        Join-Path $env:USERPROFILE "AppData\Local"
+    } else {
+        $env:TEMP
+    }
+}
+$script:GTG_DATA_DIR = Join-Path $secureLocalAppDir "GTG-Printers"
+try {
+    if (-not (Test-Path $script:GTG_DATA_DIR)) {
+        New-Item -Path $script:GTG_DATA_DIR -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    # Enforce strict NTFS permissions: Owner/User + Admins + SYSTEM only (CWE-732)
+    if (Test-Path $script:GTG_DATA_DIR) {
+        $acl = Get-Acl -LiteralPath $script:GTG_DATA_DIR -ErrorAction SilentlyContinue
+        if ($acl) {
+            $userRef = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $adminSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+            $systemSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+            
+            $acl.SetAccessRuleProtection($true, $false)
+            $ruleUser = New-Object System.Security.AccessControl.FileSystemAccessRule($userRef, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit", [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+            $ruleAdmin = New-Object System.Security.AccessControl.FileSystemAccessRule($adminSid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit", [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+            $ruleSys = New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit", [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+            
+            $acl.ResetAccessRule($ruleUser)
+            $acl.AddAccessRule($ruleAdmin)
+            $acl.AddAccessRule($ruleSys)
+            Set-Acl -LiteralPath $script:GTG_DATA_DIR -AclObject $acl -ErrorAction SilentlyContinue
+        }
+    }
+} catch [System.Exception] {
+    Write-Verbose "Could not secure GTG data directory: $($_.Exception.Message)"
+}
+
+if (-not $LogPath) {
+    $LogPath = Join-Path $script:GTG_DATA_DIR "PrinterInstaller.log"
+}
+
+# Registry security: enforce strict REG_SZ and REG_DWORD to prevent REG_EXPAND_SZ environment injection (CWE-642/CWE-73)
+function Set-SecureRegistryString {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [string]$Value
+    )
+    try {
+        if (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue) {
+            Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+        }
+        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType String -Force -ErrorAction Stop | Out-Null
+    } catch [System.Exception] {
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type String -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-SecureRegistryDWord {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [int]$Value
+    )
+    try {
+        if (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue) {
+            Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+        }
+        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+    } catch [System.Exception] {
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# COM Object lifecycle management (CWE-404/CWE-775)
+$wshellNetwork = $null
+
+function Get-WScriptNetwork {
+    if (-not $script:wshellNetwork) {
+        try {
+            $script:wshellNetwork = New-Object -ComObject WScript.Network
+        } catch [System.Exception] {
+            Write-Verbose "Could not instantiate WScript.Network COM object: $($_.Exception.Message)"
+        }
+    }
+    return $script:wshellNetwork
+}
+
+function Release-WScriptNetwork {
+    if ($script:wshellNetwork) {
+        try {
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($script:wshellNetwork) | Out-Null
+        } catch [System.Exception] {
+            Write-Verbose "Could not release WScript.Network COM object: $($_.Exception.Message)"
+        } finally {
+            $script:wshellNetwork = $null
+        }
+    }
+}
 
 try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -200,10 +387,26 @@ $BOX = @{
     CHECK = [char]0x2714 # ✔
     CROSS = [char]0x2718 # ✘
     ARROW = [char]0x25B8 # ▸
+
+    BLOCK_FULL  = [char]0x2588 # █
+    BLOCK_LIGHT = [char]0x2591 # ░
 }
 
 $MIN_TUI_WIDTH = 75
 $MAX_TUI_WIDTH = 100
+
+function Get-ProgressBarString {
+    param(
+        [int]$Percent,
+        [int]$Width = 20
+    )
+    $Percent = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $filled = [int][Math]::Round(($Percent / 100.0) * $Width)
+    $empty = [Math]::Max(0, $Width - $filled)
+    $fillStr = if ($filled -gt 0) { [string]::new([char]0x2588, $filled) } else { "" }
+    $emptyStr = if ($empty -gt 0) { [string]::new([char]0x2591, $empty) } else { "" }
+    return "{0}{1} {2,3}%" -f $fillStr, $emptyStr, $Percent
+}
 
 function Get-DynamicWidth {
     param([string[]]$Lines, [int]$MinWidth = $script:MIN_TUI_WIDTH, [int]$MaxWidth = $script:MAX_TUI_WIDTH)
@@ -224,11 +427,25 @@ $MAX_LOG_SIZE_BYTES = 2MB
 function Rotate-LogFileIfNeeded {
     try {
         if (Test-Path $LogPath) {
-            $file = Get-Item $LogPath -ErrorAction SilentlyContinue
-            if ($file -and $file.Length -gt $MAX_LOG_SIZE_BYTES) {
-                $archive = "$LogPath.old"
-                if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
-                Rename-Item -Path $LogPath -NewName (Split-Path $archive -Leaf) -Force -ErrorAction SilentlyContinue
+            $file = Get-Item -LiteralPath $LogPath -ErrorAction SilentlyContinue
+            if ($file) {
+                # Protect against symlink / reparse point attacks (CWE-59/CWE-367)
+                if ($file.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+                    Write-Verbose "Security Alert: Reparse point detected at $LogPath. Refusing log rotation."
+                    return
+                }
+                if ($file.Length -gt $MAX_LOG_SIZE_BYTES) {
+                    $archive = "$LogPath.old"
+                    if (Test-Path $archive) {
+                        $archItem = Get-Item -LiteralPath $archive -ErrorAction SilentlyContinue
+                        if ($archItem -and $archItem.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+                            Write-Verbose "Security Alert: Reparse point detected at archive $archive. Aborting rotation."
+                            return
+                        }
+                        Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+                    }
+                    Rename-Item -LiteralPath $LogPath -NewName (Split-Path $archive -Leaf) -Force -ErrorAction SilentlyContinue
+                }
             }
         }
     } catch [System.Exception] {
@@ -249,7 +466,14 @@ function Write-Log {
     Rotate-LogFileIfNeeded
 
     try {
-        Add-Content -Path $LogPath -Value $logEntry -ErrorAction SilentlyContinue
+        # Verify target is not a symlink/reparse point before appending (CWE-59)
+        if (Test-Path $LogPath) {
+            $existing = Get-Item -LiteralPath $LogPath -ErrorAction SilentlyContinue
+            if ($existing -and $existing.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+                return
+            }
+        }
+        Add-Content -LiteralPath $LogPath -Value $logEntry -ErrorAction SilentlyContinue
     } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
         # Non-fatal log write error
     } catch [System.Exception] {
@@ -373,10 +597,11 @@ function Show-NoticeBox {
 if ($ShowLog) {
     if (Test-Path $LogPath) {
         Write-Host "Opening log file: $LogPath" -ForegroundColor Cyan
-        Start-Process notepad.exe -ArgumentList "`"$LogPath`""
+        Start-Process -FilePath $script:NOTEPAD_EXE -ArgumentList "`"$LogPath`""
     } else {
         Write-Host "Log file does not exist yet at: $LogPath" -ForegroundColor Yellow
     }
+    Release-WScriptNetwork
     exit 0
 }
 
@@ -386,6 +611,7 @@ if ($ShowLog) {
 if ($OpenSettings) {
     Write-Host "Opening Windows Printers & Scanners Settings..." -ForegroundColor Cyan
     Start-Process "ms-settings:printers"
+    Release-WScriptNetwork
     exit 0
 }
 
@@ -415,10 +641,27 @@ if ($RestartSpooler) {
     Show-SectionHeader -StepTitle "SERVICE MAINTENANCE: FLUSH & RESTART PRINT SPOOLER" -Color Yellow
 
     if (-not $isAdmin) {
+        $scriptPath = $MyInvocation.MyCommand.Path
+        # Block elevation from untrusted UNC shares or removable media (CWE-829/CWE-250)
+        if (-not (Test-IsLocalFixedDrivePath -filePath $scriptPath)) {
+            Write-Log "  $($BOX.CROSS) Elevation Blocked: Script must run from a local fixed drive (CWE-829/CWE-250)." -ForegroundColor Red
+            Show-NoticeBox -Header "ELEVATION SECURITY RESTRICTION" -BodyLines @(
+                "Self-elevation from network shares (UNC) or removable drives is blocked",
+                "to prevent privilege escalation and binary planting vulnerabilities.",
+                "Path: $scriptPath",
+                "Please copy Install-Printers.ps1 to a local fixed drive (e.g. C:) and re-run."
+            ) -Color Red
+            if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
+                Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            Release-WScriptNetwork
+            exit 1
+        }
+
         Write-Log "  $($BOX.ARROW) Administrative rights required. Requesting UAC elevation... " -NoNewLine
         try {
-            $scriptPath = $MyInvocation.MyCommand.Path
-            $process = Start-Process -FilePath "powershell.exe" `
+            $process = Start-Process -FilePath $script:POWERSHELL_EXE `
                 -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -RestartSpooler -NoPause" `
                 -Verb RunAs -PassThru -Wait
             if ($process.ExitCode -eq 0) {
@@ -434,6 +677,7 @@ if ($RestartSpooler) {
             Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
+        Release-WScriptNetwork
         exit 0
     }
 
@@ -448,9 +692,11 @@ if ($RestartSpooler) {
 
     Write-Log "  $($BOX.ARROW) Purging stuck print jobs from spool directory... " -NoNewLine
     try {
-        $spoolDir = "$env:SystemRoot\System32\spool\PRINTERS"
+        $spoolDir = Join-Path $script:SYSTEM32 "spool\PRINTERS"
         if (Test-Path $spoolDir) {
-            Get-ChildItem -Path $spoolDir -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $spoolDir -Force -ErrorAction SilentlyContinue | Where-Object {
+                -not $_.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)
+            } | Remove-Item -Force -ErrorAction SilentlyContinue
         }
         Write-Log "CLEARED $($BOX.CHECK)" -ForegroundColor Green
     } catch [System.Exception] {
@@ -472,6 +718,7 @@ if ($RestartSpooler) {
         Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
+    Release-WScriptNetwork
     exit 0
 }
 
@@ -542,10 +789,27 @@ if ($FixPointAndPrint) {
 
     # Self-Elevation: Relaunch with elevation if running as standard user
     if (-not $isAdmin) {
+        $scriptPath = $MyInvocation.MyCommand.Path
+        # Block elevation from untrusted UNC shares or removable media (CWE-829/CWE-250)
+        if (-not (Test-IsLocalFixedDrivePath -filePath $scriptPath)) {
+            Write-Log "  $($BOX.CROSS) Elevation Blocked: Script must run from a local fixed drive (CWE-829/CWE-250)." -ForegroundColor Red
+            Show-NoticeBox -Header "ELEVATION SECURITY RESTRICTION" -BodyLines @(
+                "Self-elevation from network shares (UNC) or removable drives is blocked",
+                "to prevent privilege escalation and binary planting vulnerabilities.",
+                "Path: $scriptPath",
+                "Please copy Install-Printers.ps1 to a local fixed drive (e.g. C:) and re-run."
+            ) -Color Red
+            if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
+                Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            Release-WScriptNetwork
+            exit 1
+        }
+
         Write-Log "  $($BOX.ARROW) Administrative rights required. Requesting UAC elevation... " -NoNewLine
         try {
-            $scriptPath = $MyInvocation.MyCommand.Path
-            $process = Start-Process -FilePath "powershell.exe" `
+            $process = Start-Process -FilePath $script:POWERSHELL_EXE `
                 -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -FixPointAndPrint -NoPause" `
                 -Verb RunAs -PassThru -Wait
             if ($process.ExitCode -eq 0) {
@@ -567,6 +831,7 @@ if ($FixPointAndPrint) {
             Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
+        Release-WScriptNetwork
         exit 0
     }
 
@@ -577,16 +842,16 @@ if ($FixPointAndPrint) {
             New-Item -Path $policiesPath -Force | Out-Null
         }
 
-        Set-ItemProperty -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0 -Type DWord -Force
-        Set-ItemProperty -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1 -Type DWord -Force
+        Set-SecureRegistryDWord -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0
+        Set-SecureRegistryDWord -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1
 
         $serverListPath = "$policiesPath\ListofServers"
         if (-not (Test-Path $serverListPath)) {
             New-Item -Path $serverListPath -Force | Out-Null
         }
-        Set-ItemProperty -Path $serverListPath -Name $serverHost -Value $serverHost -Type String -Force
+        Set-SecureRegistryString -Path $serverListPath -Name $serverHost -Value $serverHost
         if ($FallbackIP) {
-            Set-ItemProperty -Path $serverListPath -Name $FallbackIP -Value $FallbackIP -Type String -Force
+            Set-SecureRegistryString -Path $serverListPath -Name $FallbackIP -Value $FallbackIP
         }
 
         Show-NoticeBox -Header "SUCCESSFULLY CONFIGURED" -BodyLines @(
@@ -601,6 +866,7 @@ if ($FixPointAndPrint) {
         Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
+    Release-WScriptNetwork
     exit 0
 }
 
@@ -646,6 +912,7 @@ if ($ListInstalled) {
         Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
+    Release-WScriptNetwork
     exit 0
 }
 
@@ -661,7 +928,8 @@ if ($ListAvailable) {
     $foundPrinters = @()
     foreach ($target in $targets) {
         try {
-            $netView = net.exe view $target 2>&1
+            $cleanTarget = $target -replace '["\r\n]', ''
+            $netView = & $script:NET_EXE view $cleanTarget 2>&1
             $printerLines = $netView | Where-Object { $_ -match "Print|Skrivare" }
             foreach ($line in $printerLines) {
                 $parts = $line -split '\s{2,}'
@@ -692,31 +960,42 @@ if ($ListAvailable) {
         Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
+    Release-WScriptNetwork
     exit 0
 }
 
 # -------------------------------------------------------------
 # CORE COMMON ENGINES
 # -------------------------------------------------------------
-$wshellNetwork = $null
-
-function Get-WScriptNetwork {
-    if (-not $script:wshellNetwork) {
-        try {
-            $script:wshellNetwork = New-Object -ComObject WScript.Network
-        } catch [System.Exception] {
-            Write-Verbose "Could not instantiate WScript.Network COM object: $($_.Exception.Message)"
+function Test-PrinterExists([string]$printerPath) {
+    try {
+        if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+            $p = Get-Printer -Name $printerPath -ErrorAction SilentlyContinue
+            if ($p) { return $true }
         }
+    } catch [System.Exception] {
+        Write-Verbose "Get-Printer check failed: $($_.Exception.Message)"
     }
-    return $script:wshellNetwork
+    try {
+        $escPath = $printerPath -replace '\\', '\\'
+        $cp = Get-CimInstance -ClassName Win32_Printer -Filter "Name = '$escPath'" -ErrorAction SilentlyContinue
+        if ($cp) { return $true }
+    } catch [System.Exception] {
+        Write-Verbose "Win32_Printer check failed: $($_.Exception.Message)"
+    }
+    return $false
 }
 
 function Disconnect-PrinterSafe([string]$printerPath) {
+    if (-not (Test-PrinterExists -printerPath $printerPath)) {
+        return $false
+    }
+
     $unmapped = $false
     try {
         if (Get-Command Remove-PrinterConnection -ErrorAction SilentlyContinue) {
             Remove-PrinterConnection -Name $printerPath -ErrorAction Stop
-            $unmapped = $true
+            $unmapped = -not (Test-PrinterExists -printerPath $printerPath)
         }
     } catch [System.Exception] {
         Write-Verbose "Remove-PrinterConnection failed for ${printerPath}: $($_.Exception.Message)"
@@ -727,7 +1006,7 @@ function Disconnect-PrinterSafe([string]$printerPath) {
             $net = Get-WScriptNetwork
             if ($net) {
                 $net.RemovePrinterConnection($printerPath, $true, $true)
-                $unmapped = $true
+                $unmapped = -not (Test-PrinterExists -printerPath $printerPath)
             }
         } catch [System.Exception] {
             Write-Verbose "WScript.Network RemovePrinterConnection failed for ${printerPath}: $($_.Exception.Message)"
@@ -736,8 +1015,10 @@ function Disconnect-PrinterSafe([string]$printerPath) {
 
     if (-not $unmapped) {
         try {
-            $proc = Start-Process rundll32.exe -ArgumentList "printui.dll,PrintUIEntry /dn /n `"$printerPath`" /q" -Wait -PassThru
-            if ($proc.ExitCode -eq 0) { $unmapped = $true }
+            $cleanPath = $printerPath -replace '["\r\n]', ''
+            $proc = Start-Process -FilePath $script:RUNDLL32_EXE -ArgumentList "printui.dll,PrintUIEntry /dn /n `"$cleanPath`" /q" -Wait -PassThru
+            Start-Sleep -Milliseconds 300
+            $unmapped = -not (Test-PrinterExists -printerPath $printerPath)
         } catch [System.Exception] {
             Write-Verbose "printui.dll disconnect failed for ${printerPath}: $($_.Exception.Message)"
         }
@@ -752,35 +1033,81 @@ function Disconnect-PrinterSafe([string]$printerPath) {
 if ($Uninstall) {
     Show-SectionHeader -StepTitle "UNINSTALLATION: REMOVING PRINTER CONNECTIONS" -Color Yellow
 
+    $uninstallResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $uninstalledCount = 0
-    foreach ($printer in $Printers) {
-        $printerClean = $printer.Trim().TrimStart('\')
-        $possiblePaths = @(
-            "$serverClean\$printerClean",
-            "\\$FallbackIP\$printerClean"
-        )
 
-        foreach ($pPath in $possiblePaths) {
-            Write-Log "  $($BOX.ARROW) Removing: $pPath ... " -NoNewLine
-            $ok = Disconnect-PrinterSafe -printerPath $pPath
-            if ($ok) {
-                Write-Log "REMOVED" -ForegroundColor Green
-                $uninstalledCount++
-            } else {
-                Write-Log "NOT FOUND / SKIPPED" -ForegroundColor DarkGray
-            }
+    # Query currently installed network printers to avoid network/DNS timeouts
+    $installedNetworkPrinters = @()
+    try {
+        if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+            $installedNetworkPrinters = @(Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq "Connection" -or $_.PortName -like "\\*" })
+        }
+    } catch [System.Exception] {
+        Write-Verbose "Get-Printer query failed: $($_.Exception.Message)"
+    }
+    if ($installedNetworkPrinters.Count -eq 0) {
+        try {
+            $installedNetworkPrinters = @(Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue | Where-Object { $_.Network -eq $true })
+        } catch [System.Exception] {
+            Write-Verbose "Win32_Printer CIM query failed: $($_.Exception.Message)"
         }
     }
 
-    Show-NoticeBox -Header "UNINSTALLATION COMPLETE" -BodyLines @(
-        "Successfully removed $uninstalledCount printer connection(s).",
-        "Elapsed Time: $($scriptStopwatch.Elapsed.TotalSeconds.ToString('F1')) seconds"
-    ) -Color Green
+    foreach ($printer in $Printers) {
+        $printerClean = $printer.Trim().TrimStart('\')
+        
+        # Match any installed printer ending in \$printerClean or equal to $printerClean
+        $matches = @($installedNetworkPrinters | Where-Object { $_.Name -like "*\$printerClean" -or $_.Name -eq $printerClean })
+
+        $wasRemoved = $false
+        if ($matches.Count -gt 0) {
+            foreach ($m in $matches) {
+                $ok = Disconnect-PrinterSafe -printerPath $m.Name
+                if ($ok) { $wasRemoved = $true }
+            }
+        } else {
+            # Check direct fallback IP path just in case
+            $directPath = "\\$FallbackIP\$printerClean"
+            if (Test-PrinterExists -printerPath $directPath) {
+                $ok = Disconnect-PrinterSafe -printerPath $directPath
+                if ($ok) { $wasRemoved = $true }
+            }
+        }
+
+        if ($wasRemoved) {
+            $uninstalledCount++
+            Write-Log ("  {0} {1,-14} : UNINSTALLED {2}" -f $BOX.ARROW, $printerClean, $BOX.CHECK) -ForegroundColor Green
+            $uninstallResults.Add([PSCustomObject]@{
+                Printer = $printerClean
+                Status  = "Uninstalled"
+                Mark    = $BOX.CHECK
+            })
+        } else {
+            Write-Log ("  {0} {1,-14} : NOT INSTALLED" -f $BOX.ARROW, $printerClean) -ForegroundColor DarkGray
+            $uninstallResults.Add([PSCustomObject]@{
+                Printer = $printerClean
+                Status  = "Not Installed"
+                Mark    = "-"
+            })
+        }
+    }
+
+    $elapsedSeconds = $scriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
+    $summaryLines = @()
+    foreach ($r in $uninstallResults) {
+        $summaryLines += ("{0}  {1,-14} : {2}" -f $r.Mark, $r.Printer, $r.Status)
+    }
+    $summaryLines += ""
+    $summaryLines += "Total: $($Printers.Count)  |  Uninstalled: $uninstalledCount  |  Duration: ${elapsedSeconds}s"
+    $summaryLines += "Log Saved to: $LogPath"
+
+    Show-NoticeBox -Header "UNINSTALLATION OUTCOME" -BodyLines $summaryLines -Color Green
 
     if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
         Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
+    Release-WScriptNetwork
     exit 0
 }
 
@@ -796,12 +1123,12 @@ if ($isAdmin) {
     try {
         $policiesPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
         if (-not (Test-Path $policiesPath)) { New-Item -Path $policiesPath -Force | Out-Null }
-        Set-ItemProperty -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-SecureRegistryDWord -Path $policiesPath -Name "RestrictDriverInstallationToAdministrators" -Value 0
+        Set-SecureRegistryDWord -Path $policiesPath -Name "PackagePointAndPrintServerList" -Value 1
         $serverListPath = "$policiesPath\ListofServers"
         if (-not (Test-Path $serverListPath)) { New-Item -Path $serverListPath -Force | Out-Null }
-        Set-ItemProperty -Path $serverListPath -Name $serverHost -Value $serverHost -Type String -Force -ErrorAction SilentlyContinue
-        if ($FallbackIP) { Set-ItemProperty -Path $serverListPath -Name $FallbackIP -Value $FallbackIP -Type String -Force -ErrorAction SilentlyContinue }
+        Set-SecureRegistryString -Path $serverListPath -Name $serverHost -Value $serverHost
+        if ($FallbackIP) { Set-SecureRegistryString -Path $serverListPath -Name $FallbackIP -Value $FallbackIP }
         Write-Verbose "Automated Point-and-Print policy verification: Applied"
     } catch [System.Exception] {
         Write-Verbose "Automated Point-and-Print policy check encountered: $($_.Exception.Message)"
@@ -835,9 +1162,11 @@ try {
 # 1c. Clear corrupted stuck spooler files if elevated
 if ($isAdmin -and $spoolerOk) {
     try {
-        $spoolDir = "$env:SystemRoot\System32\spool\PRINTERS"
+        $spoolDir = Join-Path $script:SYSTEM32 "spool\PRINTERS"
         if (Test-Path $spoolDir) {
-            $stuckFiles = Get-ChildItem -Path $spoolDir -Force -ErrorAction SilentlyContinue
+            $stuckFiles = Get-ChildItem -Path $spoolDir -Force -ErrorAction SilentlyContinue | Where-Object {
+                -not $_.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)
+            }
             if ($stuckFiles.Count -gt 0) {
                 Write-Log "  $($BOX.ARROW) Flushing $($stuckFiles.Count) stale spool files... " -NoNewLine
                 Stop-Service -Name "Spooler" -Force -ErrorAction SilentlyContinue
@@ -864,9 +1193,16 @@ while ($networkLoopActive) {
     try {
         $dnsTask = [System.Net.Dns]::GetHostAddressesAsync($serverHost)
         if ($dnsTask.Wait(2000)) {
-            $resolvedIPs = $dnsTask.Result | ForEach-Object { $_.IPAddressToString }
-            Write-Log "OK ($($resolvedIPs -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
-            $activeServer = $serverClean
+            $rawIPs = @($dnsTask.Result | ForEach-Object { $_.IPAddressToString })
+            # Block public IPs from DNS to prevent NetNTLM hash capture (CWE-200/CWE-300)
+            $privateIPs = @($rawIPs | Where-Object { Test-IsPrivateIPAddress $_ })
+            if ($privateIPs.Count -gt 0) {
+                $resolvedIPs = $privateIPs
+                Write-Log "OK ($($resolvedIPs -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
+                $activeServer = $serverClean
+            } else {
+                Write-Log "REJECTED (DNS returned public IP: $($rawIPs -join ', ')) $($BOX.CROSS)" -ForegroundColor Yellow
+            }
         } else {
             Write-Log "PRIMARY DNS UNRESOLVED" -ForegroundColor Yellow
         }
@@ -882,7 +1218,7 @@ while ($networkLoopActive) {
             try {
                 $internalDnsRes = Resolve-DnsName -Name $serverHost -Server $dc -QuickTimeout -ErrorAction Stop
                 if ($internalDnsRes) {
-                    $ips = @($internalDnsRes | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress)
+                    $ips = @($internalDnsRes | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress | Where-Object { Test-IsPrivateIPAddress $_ })
                     if ($ips.Count -gt 0) {
                         $resolvedInternalIP = $ips[0]
                         Write-Log "RESOLVED via $dc ($($ips -join ', ')) $($BOX.CHECK)" -ForegroundColor Green
@@ -909,6 +1245,8 @@ while ($networkLoopActive) {
     $targetHostForSMB = $activeServer.TrimStart('\')
     Write-Log "  $($BOX.ARROW) Port 445 (SMB) Check  : " -NoNewLine
     $tcpClient = New-Object System.Net.Sockets.TcpClient
+    # Disable socket linger to immediately free OS socket descriptors upon close (CWE-400)
+    $tcpClient.LingerState = New-Object System.Net.Sockets.LingerOption($true, 0)
     $smbReachable = $false
     try {
         $connectTask = $tcpClient.ConnectAsync($targetHostForSMB, 445)
@@ -922,8 +1260,13 @@ while ($networkLoopActive) {
         $errMsg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
         Write-Log "UNREACHABLE ($errMsg) $($BOX.CROSS)" -ForegroundColor Yellow
     } finally {
-        $tcpClient.Close()
-        $tcpClient.Dispose()
+        try {
+            if ($tcpClient.Client) { $tcpClient.Client.Close(0) }
+            $tcpClient.Close()
+            $tcpClient.Dispose()
+        } catch [System.Exception] {
+            Write-Verbose "Socket cleanup: $($_.Exception.Message)"
+        }
     }
 
     if ($smbReachable -or $ForceInstall) {
@@ -938,17 +1281,21 @@ while ($networkLoopActive) {
                 "Current SSID: $(Get-ActiveSSID)",
                 "",
                 "Please connect to the GTG school Wi-Fi (GTC Student / Staff) or VPN.",
-                "Press [R] to retry connection, or [Enter / Q] to exit."
+                "Type 'R' and press Enter to retry, or press Enter / 'Q' to exit."
             ) -Color Yellow
 
-            Write-Host "`n  Action: [R] Retry  |  [Any Other Key] Exit : " -ForegroundColor Cyan -NoNewline
-            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            Write-Host ""
-            if ($key.Character -eq 'r' -or $key.Character -eq 'R') {
+            $choice = Read-Host "`n  Action: Enter 'R' to Retry, or press Enter/Q to Exit"
+            if ($choice -and $choice.Trim() -match '^(r|retry)$') {
                 Write-Host "`nRefreshing network interfaces and retrying...`n" -ForegroundColor Cyan
-                Start-Sleep -Seconds 1
+                try {
+                    Clear-DnsClientCache -ErrorAction SilentlyContinue
+                } catch [System.Exception] {
+                    Write-Verbose "Clear-DnsClientCache failed: $($_.Exception.Message)"
+                }
+                Start-Sleep -Seconds 2
                 continue
             } else {
+                Release-WScriptNetwork
                 exit 2
             }
         } else {
@@ -965,6 +1312,7 @@ while ($networkLoopActive) {
                 " Device must be connected to the GTG school network (GTC Student/Staff).",
                 " (To attempt installation anyway, re-run with: .\Install-Printers.ps1 -ForceInstall)"
             ) -Color Red
+            Release-WScriptNetwork
             exit 2
         }
     }
@@ -973,10 +1321,15 @@ while ($networkLoopActive) {
 # Step 3: Multi-layer Connection Engines
 Show-SectionHeader -StepTitle "STEP 3/4: INSTALLING & MAPPING PRINTERS" -Color Cyan
 
-function Connect-PrinterSafe([string]$printerPath) {
+function Connect-PrinterSafe {
+    param(
+        [string]$printerPath,
+        [scriptblock]$OnProgress = $null
+    )
     $errors = @{}
 
     # Engine 1: WMI Win32_Printer Method
+    if ($OnProgress) { & $OnProgress 25 "Connecting via Engine 1/4 (WMI)..." }
     try {
         $wmiPrinterClass = [wmiclass]"Win32_Printer"
         $result = $wmiPrinterClass.AddPrinterConnection($printerPath)
@@ -990,6 +1343,7 @@ function Connect-PrinterSafe([string]$printerPath) {
     }
 
     # Engine 2: Windows PrintManagement PowerShell Cmdlet
+    if ($OnProgress) { & $OnProgress 50 "Connecting via Engine 2/4 (Add-PrinterConnection)..." }
     try {
         if (Get-Command Add-PrinterConnection -ErrorAction SilentlyContinue) {
             Add-PrinterConnection -Name $printerPath -ErrorAction Stop
@@ -1000,6 +1354,7 @@ function Connect-PrinterSafe([string]$printerPath) {
     }
 
     # Engine 3: WScript.Network COM Object
+    if ($OnProgress) { & $OnProgress 75 "Connecting via Engine 3/4 (WScript.Network COM)..." }
     try {
         $net = Get-WScriptNetwork
         if ($net) {
@@ -1011,8 +1366,10 @@ function Connect-PrinterSafe([string]$printerPath) {
     }
 
     # Engine 4: printui.dll Windows API
+    if ($OnProgress) { & $OnProgress 90 "Connecting via Engine 4/4 (printui.dll API)..." }
     try {
-        $proc = Start-Process -FilePath "rundll32.exe" -ArgumentList "printui.dll,PrintUIEntry /in /n `"$printerPath`" /q" -Wait -PassThru
+        $cleanPath = $printerPath -replace '["\r\n]', ''
+        $proc = Start-Process -FilePath $script:RUNDLL32_EXE -ArgumentList "printui.dll,PrintUIEntry /in /n `"$cleanPath`" /q" -Wait -PassThru
         if ($proc.ExitCode -eq 0) {
             Start-Sleep -Milliseconds 500
             return @{ Success = $true; Engine = "printui.dll /in (Windows API)" }
@@ -1053,7 +1410,8 @@ function Set-DefaultPrinterSafe([string]$printerPath) {
 
 function Send-TestPageSafe([string]$printerPath) {
     try {
-        $proc = Start-Process rundll32.exe -ArgumentList "printui.dll,PrintUIEntry /k /n `"$printerPath`"" -Wait -PassThru
+        $cleanPath = $printerPath -replace '["\r\n]', ''
+        $proc = Start-Process -FilePath $script:RUNDLL32_EXE -ArgumentList "printui.dll,PrintUIEntry /k /n `"$cleanPath`"" -Wait -PassThru
         return ($proc.ExitCode -eq 0)
     } catch [System.Exception] {
         Write-Verbose "Send-TestPageSafe failed for ${printerPath}: $($_.Exception.Message)"
@@ -1062,22 +1420,50 @@ function Send-TestPageSafe([string]$printerPath) {
 }
 
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+$totalPrinters = $Printers.Count
+$isInteractiveTerminal = ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive -and -not [Console]::IsOutputRedirected)
 
-foreach ($printer in $Printers) {
+for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
+    $printer = $Printers[$pIdx]
     $printerClean = $printer.Trim().TrimStart('\')
-    
+    $copierNum = $pIdx + 1
+
+    $overallPct = [int][Math]::Round(($pIdx / $totalPrinters) * 100)
+    Write-Log ""
+    Write-Log "  Overall  : $(Get-ProgressBarString $overallPct) (Copier $copierNum of $totalPrinters)" -ForegroundColor Cyan
+
+    if ($isInteractiveTerminal) {
+        try {
+            Write-Progress -Activity "GTG Printer Installation" -Status "Overall: $overallPct% (Copier $copierNum of $totalPrinters)" -PercentComplete $overallPct -Id 1
+        } catch [System.Exception] {
+            Write-Verbose "Write-Progress overall error: $($_.Exception.Message)"
+        }
+    }
+
     $candidatePaths = @("$activeServer\$printerClean")
     if ($FallbackIP -and $activeServer -ne "\\$FallbackIP") {
         $candidatePaths += "\\$FallbackIP\$printerClean"
     }
 
-    Write-Log ""
-    Write-Log "  $($BOX.ARROW) Mapping: $printerClean (Target: $($candidatePaths[0]))" -ForegroundColor White
+    Write-Log "  $($BOX.ARROW) [$copierNum/$totalPrinters] $printerClean" -ForegroundColor White
+    Write-Log "    Target : $($candidatePaths[0])" -ForegroundColor DarkGray
 
     $installSuccess = $false
     $usedEngine = ""
     $usedUNC = ""
     $attemptErrors = @{}
+
+    $onProgress = {
+        param([int]$pct, [string]$stage)
+        if ($isInteractiveTerminal) {
+            Write-Host ("`r    Status : {0}  {1}      " -f (Get-ProgressBarString $pct), $stage) -ForegroundColor DarkCyan -NoNewline
+            try {
+                Write-Progress -Activity "GTG Printer Installation" -Status "[$copierNum/$totalPrinters] ${printerClean}: $stage" -PercentComplete $pct -Id 2 -ParentId 1
+            } catch [System.Exception] {
+                Write-Verbose "Write-Progress copier error: $($_.Exception.Message)"
+            }
+        }
+    }
 
     foreach ($uncPath in $candidatePaths) {
         if ($RemoveExisting) {
@@ -1086,11 +1472,12 @@ foreach ($printer in $Printers) {
 
         for ($attempt = 1; $attempt -le ($MaxRetries + 1); $attempt++) {
             if ($attempt -gt 1) {
+                if ($isInteractiveTerminal) { Write-Host "" }
                 Write-Log "    [Retry $attempt/$($MaxRetries + 1)] Waiting $RetryDelaySeconds s..." -ForegroundColor Yellow
                 Start-Sleep -Seconds $RetryDelaySeconds
             }
 
-            $res = Connect-PrinterSafe -printerPath $uncPath
+            $res = Connect-PrinterSafe -printerPath $uncPath -OnProgress $onProgress
             if ($res.Success) {
                 $installSuccess = $true
                 $usedEngine = $res.Engine
@@ -1105,7 +1492,10 @@ foreach ($printer in $Printers) {
     }
 
     if ($installSuccess) {
-        Write-Log "    Status : CONNECTED $($BOX.CHECK)" -ForegroundColor Green
+        if ($isInteractiveTerminal) {
+            Write-Host ("`r    Status : {0}  CONNECTED {1} ({2})                                " -f (Get-ProgressBarString 100), $BOX.CHECK, $usedEngine) -ForegroundColor Green
+        }
+        Write-Log "    Status : $(Get-ProgressBarString 100) CONNECTED $($BOX.CHECK)" -ForegroundColor Green -NoConsole:$isInteractiveTerminal
         Write-Log "    Path   : $usedUNC" -ForegroundColor DarkCyan
         Write-Log "    Engine : $usedEngine" -ForegroundColor DarkCyan
 
@@ -1141,7 +1531,10 @@ foreach ($printer in $Printers) {
             Error     = ""
         })
     } else {
-        Write-Log "    Status : FAILED $($BOX.CROSS)" -ForegroundColor Red
+        if ($isInteractiveTerminal) {
+            Write-Host ("`r    Status : {0}  FAILED {1}                                         " -f (Get-ProgressBarString 0), $BOX.CROSS) -ForegroundColor Red
+        }
+        Write-Log "    Status : $(Get-ProgressBarString 0) FAILED $($BOX.CROSS)" -ForegroundColor Red -NoConsole:$isInteractiveTerminal
         
         $translatedErrors = @()
         foreach ($key in $attemptErrors.Keys) {
@@ -1163,11 +1556,23 @@ foreach ($printer in $Printers) {
     }
 }
 
+if ($isInteractiveTerminal) {
+    try {
+        Write-Progress -Activity "GTG Printer Installation" -Completed -Id 2
+        Write-Progress -Activity "GTG Printer Installation" -Completed -Id 1
+    } catch [System.Exception] {
+        Write-Verbose "Write-Progress complete error: $($_.Exception.Message)"
+    }
+}
+
+Write-Log ""
+Write-Log "  Overall  : $(Get-ProgressBarString 100) (All $totalPrinters copiers processed)" -ForegroundColor Green
+
 # Step 4: Final Summary Report
 Show-SectionHeader -StepTitle "STEP 4/4: FINAL INSTALLATION SUMMARY" -Color Cyan
 
-$successCount = ($results | Where-Object { $_.Status -eq "Connected" }).Count
-$failCount = ($results | Where-Object { $_.Status -eq "Failed" }).Count
+$successCount = @($results | Where-Object { $_.Status -eq "Connected" }).Count
+$failCount = @($results | Where-Object { $_.Status -eq "Failed" }).Count
 $elapsedSeconds = $scriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
 
 $summaryLines = @()
@@ -1188,5 +1593,7 @@ if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
     Write-Host "`nPress any key to close this window..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
+
+Release-WScriptNetwork
 
 if ($failCount -gt 0) { exit 1 } else { exit 0 }

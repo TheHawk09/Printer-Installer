@@ -4,6 +4,17 @@ Enterprise network printer deployment package for Microsoft Intune, Company Port
 
 ---
 
+## Repository File Manifest
+
+| File | Purpose | Description |
+| :--- | :--- | :--- |
+| [`Install-Printers.ps1`](Install-Printers.ps1) | **Core Engine & Installer** | PowerShell deployment engine with dynamic CP437 box-drawing TUI, bracketless progress bars, 4-tier connection fallback, pre-flight diagnostics, self-healing, uninstallation, and 11 CLI operations. |
+| [`Kopiator.bat`](Kopiator.bat) | **Zero-Config Launcher** | Double-clickable batch launcher with execution policy bypass. Automatically provisions and dynamically verifies `Install-Printers.ps1` against GitHub's authoritative Git object SHA if missing. |
+| [`Detect-Printers.ps1`](Detect-Printers.ps1) | **Intune Detection Script** | Lightweight detection rule script for Microsoft Intune Win32 app deployment, validating active mapping of all required copiers in the user profile. |
+| [`.gitattributes`](.gitattributes) | **Git Normalization** | Enforces strict Windows line endings (`CRLF`) for PowerShell and Batch scripts, and `LF` for Markdown documentation. |
+
+---
+
 ## Microsoft Intune / Company Portal Deployment Guide
 
 When packaging this repository as a Win32 App (`.intunewin`) in the Microsoft Intune Admin Center:
@@ -44,7 +55,17 @@ When packaging this repository as a Win32 App (`.intunewin`) in the Microsoft In
 
 ## Standalone / Manual Usage (CLI Tags)
 
-Administrators and technicians can run [`Install-Printers.ps1`](Install-Printers.ps1) directly using command-line tags or double-clicking [`Kopiator.bat`](Kopiator.bat):
+Administrators, students, and technicians can run [`Install-Printers.ps1`](Install-Printers.ps1) directly using command-line tags or double-clicking [`Kopiator.bat`](Kopiator.bat):
+
+> **Auto-Provisioning Launcher**: If [`Kopiator.bat`](Kopiator.bat) is executed in an environment without `Install-Printers.ps1` (e.g. distributed standalone or copied to Desktop), it automatically fetches `Install-Printers.ps1` from the official repository and enforces a 4-phase integrity and security verification:
+> 1. **Size Guard**: Verifies file size exceeds 10 KB to prevent truncated or empty downloads.
+> 2. **PowerShell AST Parsing**: Invokes `[System.Management.Automation.Language.Parser]` to guarantee zero syntax or script parsing errors.
+> 3. **Content Signature**: Validates authentic GTG script tokens (`ENTERPRISE NETWORK PRINTER MANAGER`, `L-Kopiator`) to reject captive portal HTML intercepts.
+> 4. **Dynamic Cryptographic Git SHA**: Dynamically queries GitHub's REST API (`/contents/Install-Printers.ps1`) to verify that the downloaded payload's Git blob SHA bit-for-bit matches GitHub's authoritative repository object hash on `main`. No hardcoded hash files needed.
+>
+> **Automation-Aware Execution**: Passing `-NoPause` to [`Kopiator.bat`](Kopiator.bat) (e.g. `Kopiator.bat -NoPause` or `Kopiator.bat -Uninstall -NoPause`) automatically suppresses the terminal pause prompt for headless task runners and CI/CD pipelines.
+>
+> **Real-Time Visual Progress**: Displays clean bracketless progress bars (`████████████░░░░░░░░ 60%`) with simultaneous overall and per-copier tracking, alongside native Windows PowerShell `Write-Progress` taskbar integration.
 
 ### 1. Default Run (Install All Copiers)
 Installs and maps all three GTG network copiers (`L-Kopiator`, `TB-Kopiator`, `PB-Kopiator`) for the current user:
@@ -135,9 +156,32 @@ Presents a user-friendly numbered console menu to let technicians or students se
 ```
 
 ### 11. View Diagnostic Log (`-ShowLog`)
-Opens the timestamped log file (`%TEMP%\PrinterInstaller.log`) directly in Notepad for instant review. The log automatically archives and rotates when exceeding 2 MB:
+Opens the timestamped log file (`%LOCALAPPDATA%\GTG-Printers\PrinterInstaller.log`) directly in Notepad for instant review. The log automatically archives and rotates when exceeding 2 MB:
 ```powershell
 .\Install-Printers.ps1 -ShowLog
+```
+
+### 12. Dynamic Cryptographic Audit (Git Object SHA)
+To manually audit and verify that your local copy of `Install-Printers.ps1` matches GitHub's authoritative blob SHA without relying on static files:
+```powershell
+# 1. Fetch remote authoritative SHA dynamically from GitHub API:
+$wc = New-Object System.Net.WebClient
+$wc.Headers['User-Agent'] = 'PrinterInstaller/1.0'
+$remoteSha = ($wc.DownloadString('https://api.github.com/repos/TheHawk09/Printer-Installer/contents/Install-Printers.ps1') | ConvertFrom-Json).sha
+
+# 2. Compute Git blob SHA of local file:
+$bytes = [System.IO.File]::ReadAllBytes('.\Install-Printers.ps1')
+$header = [System.Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+$all = New-Object byte[] ($header.Length + $bytes.Length)
+[Buffer]::BlockCopy($header, 0, $all, 0, $header.Length)
+[Buffer]::BlockCopy($bytes, 0, $all, $header.Length, $bytes.Length)
+$localSha = -join ([System.Security.Cryptography.SHA1]::Create().ComputeHash($all) | ForEach-Object { '{0:x2}' -f $_ })
+
+if ($remoteSha -eq $localSha) {
+    Write-Host "Integrity Verified: Local file matches GitHub main blob ($localSha)" -ForegroundColor Green
+} else {
+    Write-Host "Notice: Local file differs from GitHub main (Remote: $remoteSha, Local: $localSha)" -ForegroundColor Yellow
+}
 ```
 
 ---
@@ -168,5 +212,24 @@ Opens the timestamped log file (`%TEMP%\PrinterInstaller.log`) directly in Notep
    * **Engine 3**: Windows Script Host COM (`WScript.Network.AddWindowsPrinterConnection`)
    * **Engine 4**: Direct Windows C API (`rundll32 printui.dll,PrintUIEntry /in`)
 4. **Automated Log Rotation**:
-   * Logs timestamped actions to `%TEMP%\PrinterInstaller.log`.
+   * Logs timestamped actions to `%LOCALAPPDATA%\GTG-Printers\PrinterInstaller.log`.
    * Automatically rotates and backs up to `.old` when exceeding 2 MB.
+
+---
+
+## Enterprise Security & Reliability Hardening
+
+All deployment scripts implement rigorous security defenses against common software vulnerabilities (CWEs) and enterprise attack vectors:
+
+| Vulnerability / CWE | Mitigation Architecture |
+| :--- | :--- |
+| **CWE-200 / CWE-300 / CWE-918**<br>(NetNTLM Hash Coercion / SMB Leak) | Rejects public IP addresses in `-FallbackIP`, `-InternalDNSServers`, and DNS resolution. All SMB and RPC target addresses must strictly belong to private RFC 1918 subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) or loopback. |
+| **CWE-426 / CWE-427**<br>(Untrusted Search Path / Binary Planting) | Pins absolute executable paths to `%SystemRoot%\System32` for `notepad.exe`, `rundll32.exe`, `net.exe`, and `powershell.exe`. |
+| **CWE-829 / CWE-250**<br>(Untrusted Elevation Sphere / UAC Escalation) | Restricts self-elevation (`-Verb RunAs`) to scripts residing on local fixed drives (`DriveType.Fixed`), blocking elevated execution from untrusted network shares (UNC) or removable USB media. |
+| **CWE-732**<br>(Insecure Resource Permissions) | Hardens NTFS ACLs on `%LOCALAPPDATA%\GTG-Printers` with inheritance disabled, granting full control exclusively to the current user, local Administrators, and SYSTEM. |
+| **CWE-59 / CWE-367**<br>(Symlink Traversal & TOCTOU Attacks) | Verifies that log files, destination script caches, and spooler files are not Windows Reparse Points / junctions before writing, rotating, or purging. |
+| **CWE-494 / CWE-353 / CWE-377 / CWE-330**<br>(Code Provisioning, Dynamic Git SHA Verification & Temp Files) | In `Kopiator.bat`, auto-downloaded scripts are staged in a cryptographically unique GUID temp file, validated for minimum size (> 10 KB), parsed via PowerShell AST for 0 syntax errors, checked for authentic GTG code tokens, and dynamically verified against GitHub's authoritative Git object SHA via the GitHub REST API on the fly without requiring any hardcoded checksum files. |
+| **CWE-400 / CWE-404 / CWE-775**<br>(Resource Starvation & COM Leaks) | Disables socket linger (`LingerState = ($true, 0)`) on SMB pre-flight checks and explicitly releases COM subsystem objects (`[Marshal]::ReleaseComObject`). |
+| **CWE-642 / CWE-73**<br>(Registry Type Confusion & Injection) | Enforces explicit `REG_SZ` and `REG_DWORD` types in `HKLM` policies, purging any pre-existing values to neutralize `REG_EXPAND_SZ` environment variable injection. |
+| **CWE-88 / CWE-20**<br>(Argument Injection & Parameter Validation) | Sanitizes printer paths against embedded quotation marks and control characters before passing to native binaries, and validates all CLI parameters with strict regex. |
+| **CWE-1188**<br>(Insecure Protocol Negotiation) | Safe, fault-tolerant TLS 1.2 / TLS 1.3 protocol configuration without crashing on older .NET Framework installations. |
