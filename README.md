@@ -225,14 +225,20 @@ Linux distributions operate under fundamentally different paradigms. To ensure m
 Running via `nix run` packages the deployment engine into an isolated Nix closure without modifying system options:
 
 ```bash
-# Print a document directly to L-Kopiator (Zero host system mutation, no root):
-nix run github:TheHawk09/Printer-Installer -- --print mydoc.pdf --default "L-Kopiator"
+# Direct print shortcut via Flake app (Zero host mutation, no root):
+nix run github:TheHawk09/Printer-Installer#print -- mydoc.pdf
+
+# Or specify custom default copier:
+nix run github:TheHawk09/Printer-Installer#print -- mydoc.pdf --default "TB-Kopiator"
 
 # Run interactive diagnostics:
 nix run github:TheHawk09/Printer-Installer
 
 # Query local CUPS inventory:
 nix run github:TheHawk09/Printer-Installer -- --list-installed
+
+# Format all Nix files using official RFC 0101 standard:
+nix fmt
 ```
 
 * **Zero System Impact**: Does not touch `/etc/nixos/configuration.nix` or system options.
@@ -323,6 +329,7 @@ For users who manage user configurations with [Home Manager](https://github.com/
             enable = true;
             defaultPrinter = "L-Kopiator";
             duplex = true; # Declaratively configures ~/.cups/lpoptions
+            autostartPaperCut = true; # Auto-launches PaperCut MF client on desktop login
           };
         }
       ];
@@ -333,8 +340,10 @@ For users who manage user configurations with [Home Manager](https://github.com/
 Or copy [`gtg-home.nix`](gtg-home.nix) locally and import directly in `home.nix`:
 ```nix
 imports = [ ./gtg-home.nix ];
-programs.gtg-printers.enable = true;
-```
+programs.gtg-printers = {
+  enable = true;
+  autostartPaperCut = true;
+};
 ```
 
 ---

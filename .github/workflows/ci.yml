@@ -56,7 +56,7 @@ jobs:
         shell: python
         run: |
           import os, re, unicodedata, sys
-          files = ['Install-Printers.ps1', 'Detect-Printers.ps1', 'Kopiator.bat', 'install-printers.sh', 'gtg-printers.nix', 'gtg-home.nix', 'flake.nix', 'README.md']
+          files = ['Install-Printers.ps1', 'Detect-Printers.ps1', 'Kopiator.bat', 'install-printers.sh', 'gtg-printers.nix', 'gtg-home.nix', 'flake.nix', 'lib/defaults.nix', 'README.md']
           def is_emoji(ch):
               code = ord(ch)
               if code > 0x1F000 or (0x1F300 <= code <= 0x1F9FF):
@@ -106,7 +106,7 @@ jobs:
 
       - name: Verify Line Endings (LF for Linux/Nix scripts)
         run: |
-          for f in install-printers.sh gtg-printers.nix gtg-home.nix flake.nix; do
+          for f in install-printers.sh gtg-printers.nix gtg-home.nix flake.nix lib/defaults.nix; do
             if [ -f "$f" ]; then
               if file "$f" | grep -q "CRLF"; then
                 echo "::error file=$f::File $f contains CRLF line terminators; LF required!"

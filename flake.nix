@@ -12,8 +12,10 @@
       pkgsFor = system: nixpkgs.legacyPackages.${system};
     in
     {
-      # 1. Standalone On-Demand Application: 'nix run'
-      # Pure derivation using standard Nixpkgs stdenv & wrapProgram for hermetic execution
+      # 1. Reusable Domain Constants & Metadata
+      lib = import ./lib/defaults.nix;
+
+      # 2. Standalone On-Demand Applications: 'nix run'
       packages = forAllSystems (system:
         let
           pkgs = pkgsFor system;
@@ -27,8 +29,15 @@
               install -Dm755 ${./install-printers.sh} $out/bin/gtg-printers
               wrapProgram $out/bin/gtg-printers \
                 --set RUNNING_UNDER_NIX 1 \
-                --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ cups samba coreutils gawk gnugrep iproute2 procps iputils ])}
+                --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ cups samba coreutils gawk gnugrep gnused iproute2 procps iputils ])}
               ln -s $out/bin/gtg-printers $out/bin/install-printers
+
+              # Ergonomic direct printing shortcut (gtg-print <file.pdf>)
+              cat <<EOF > $out/bin/gtg-print
+              #!${pkgs.runtimeShell}
+              exec "\$(dirname "\$0")/gtg-printers" --print "\$@"
+              EOF
+              chmod +x $out/bin/gtg-print
             '';
             meta = with pkgs.lib; {
               description = "Enterprise network printer deployment and on-demand printing suite for GTG copiers";
@@ -41,6 +50,7 @@
         in {
           default = pkg;
           gtg-printers = pkg;
+          gtg-print = pkg;
           install-printers = pkg;
         }
       );
@@ -54,36 +64,64 @@
           type = "app";
           program = "${self.packages.${system}.default}/bin/gtg-printers";
         };
+        print = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/gtg-print";
+        };
         install-printers = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/install-printers";
         };
       });
 
-      # 2. Ephemeral Development Shell: 'nix develop'
+      # 3. Standard RFC 0101 Code Formatter: 'nix fmt'
+      formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
+
+      # 4. Ephemeral Development Shell: 'nix develop'
       devShells = forAllSystems (system:
         let pkgs = pkgsFor system; in {
           default = pkgs.mkShell {
-            packages = with pkgs; [ cups samba coreutils gawk gnugrep iputils procps ];
+            packages = with pkgs; [
+              cups
+              samba
+              coreutils
+              gawk
+              gnugrep
+              gnused
+              iputils
+              procps
+              shellcheck
+              nixfmt-rfc-style
+            ];
           };
         }
       );
 
-      # 3. Flake Checks: 'nix flake check'
-      checks = forAllSystems (system: {
-        default = self.packages.${system}.default;
-      });
+      # 5. Flake Checks: 'nix flake check'
+      checks = forAllSystems (system:
+        let
+          pkgs = pkgsFor system;
+        in {
+          package = self.packages.${system}.default;
+          shellcheck = pkgs.runCommandLocal "check-shellcheck" {
+            nativeBuildInputs = [ pkgs.shellcheck ];
+          } ''
+            shellcheck -e SC2034,SC2154,SC2181,SC1090,SC1091,SC2155 ${./install-printers.sh}
+            touch $out
+          '';
+        }
+      );
 
-      # 4. Nixpkgs Overlay
+      # 6. Nixpkgs Overlay
       overlays.default = final: prev: {
         gtg-printers = self.packages.${final.system}.default;
       };
 
-      # 5. Declarative System Module: NixOS
+      # 7. Declarative System Module: NixOS
       nixosModules.default = import ./gtg-printers.nix;
       nixosModules.gtg-printers = import ./gtg-printers.nix;
 
-      # 6. Declarative Home Manager Module
+      # 8. Declarative Home Manager Module
       homeManagerModules.default = import ./gtg-home.nix;
       homeManagerModules.gtg-printers = import ./gtg-home.nix;
     };
