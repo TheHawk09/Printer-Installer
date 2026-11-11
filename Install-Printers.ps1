@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Enterprise-grade installer, manager, and troubleshooter for network printers/copiers.
 
@@ -127,6 +127,12 @@ param(
 
     [Parameter(ParameterSetName = "Install")]
     [switch]$PrintTestPage,
+
+    [Parameter(ParameterSetName = "Install")]
+    [switch]$StartPaperCut,
+
+    [Parameter(ParameterSetName = "Install")]
+    [switch]$Duplex = $true,
 
     [Parameter(ParameterSetName = "Install")]
     [switch]$RemoveExisting,
@@ -358,6 +364,44 @@ function Release-WScriptNetwork {
             }
         }
     }
+}
+
+function Get-PaperCutClientStatus {
+    $proc = Get-Process -Name "pc-client" -ErrorAction SilentlyContinue
+    if ($proc) {
+        $pId = if ($proc -is [array]) { $proc[0].Id } else { $proc.Id }
+        return @{ Running = $true; ProcessId = $pId; Path = "" }
+    }
+    $candidatePaths = @(
+        "$env:LOCALAPPDATA\Programs\PaperCut MF Client\pc-client.exe",
+        "$env:ProgramFiles\PaperCut MF Client\pc-client.exe",
+        "${env:ProgramFiles(x86)}\PaperCut MF Client\pc-client.exe",
+        "C:\PaperCut\client\win\pc-client.exe"
+    )
+    $foundPath = ""
+    foreach ($p in $candidatePaths) {
+        if ($p -and (Test-Path $p)) {
+            $foundPath = $p
+            break
+        }
+    }
+    return @{ Running = $false; ProcessId = $null; Path = $foundPath }
+}
+
+function Start-PaperCutClientSafe {
+    $status = Get-PaperCutClientStatus
+    if ($status.Running) { return $true }
+    if ($status.Path -and (Test-Path $status.Path)) {
+        try {
+            Start-Process -FilePath $status.Path
+            Start-Sleep -Milliseconds 600
+            $procCheck = Get-Process -Name "pc-client" -ErrorAction SilentlyContinue
+            return ($null -ne $procCheck)
+        } catch [System.Exception] {
+            Write-Verbose "Could not launch PaperCut client: $($_.Exception.Message)"
+        }
+    }
+    return $false
 }
 
 try {
@@ -776,9 +820,10 @@ if ($Menu) {
     Write-Host "  [10] Fix Point-and-Print Driver Policy (Requires Admin)" -ForegroundColor White
     Write-Host "  [11] Open Windows Printers & Scanners Settings" -ForegroundColor White
     Write-Host "  [12] Open Diagnostic Log" -ForegroundColor White
+    Write-Host "  [13] Check / Launch PaperCut MF Client" -ForegroundColor White
     Write-Host "  [0]  Exit" -ForegroundColor DarkGray
     Write-Host ""
-    $choice = Read-Host "  Select an option [0-12]"
+    $choice = Read-Host "  Select an option [0-13]"
 
     switch ($choice) {
         "1"  { & $MyInvocation.MyCommand.Path -NoPause; exit 0 }
@@ -793,6 +838,16 @@ if ($Menu) {
         "10" { & $MyInvocation.MyCommand.Path -FixPointAndPrint -NoPause; exit 0 }
         "11" { & $MyInvocation.MyCommand.Path -OpenSettings; exit 0 }
         "12" { & $MyInvocation.MyCommand.Path -ShowLog; exit 0 }
+        "13" {
+            $ok = Start-PaperCutClientSafe
+            if ($ok) {
+                Write-Host "`nPaperCut Client started successfully." -ForegroundColor Green
+            } else {
+                Write-Host "`nPaperCut Client not found or could not be launched automatically." -ForegroundColor Yellow
+            }
+            Start-Sleep -Seconds 2
+            & $MyInvocation.MyCommand.Path -Menu; exit 0
+        }
         default { exit 0 }
     }
 }
@@ -1211,6 +1266,27 @@ if ($isAdmin -and $spoolerOk) {
     }
 }
 
+# 1d. PaperCut MF Client diagnostic
+Write-Log "  $($BOX.ARROW) PaperCut MF Client     : " -NoNewLine
+$pcStatus = Get-PaperCutClientStatus
+if ($pcStatus.Running) {
+    Write-Log "RUNNING (PID $($pcStatus.ProcessId)) $($BOX.CHECK)" -ForegroundColor Green
+} elseif ($pcStatus.Path) {
+    Write-Log "STOPPED (Found at $($pcStatus.Path))" -ForegroundColor Yellow
+    if ($StartPaperCut) {
+        Write-Log "  $($BOX.ARROW) Launching PaperCut... " -NoNewLine
+        if (Start-PaperCutClientSafe) {
+            Write-Log "STARTED $($BOX.CHECK)" -ForegroundColor Green
+        } else {
+            Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Red
+        }
+    } else {
+        Write-Log "    Note: PaperCut client must be running to release jobs at copiers." -ForegroundColor DarkGray
+    }
+} else {
+    Write-Log "NOT DETECTED (Run pc-client to release jobs)" -ForegroundColor DarkGray
+}
+
 # Step 2: Network & Server Reachability with Interactive Retry Loop
 Show-SectionHeader -StepTitle "STEP 2/4: NETWORK & SERVER REACHABILITY" -Color Cyan
 
@@ -1298,6 +1374,21 @@ while ($networkLoopActive) {
         } catch [System.Exception] {
             Write-Verbose "Socket cleanup: $($_.Exception.Message)"
         }
+    }
+
+    # 2e. Ping ICMP RTT Latency Telemetry
+    Write-Log "  $($BOX.ARROW) Ping Latency (ICMP)   : " -NoNewLine
+    try {
+        $pinger = New-Object System.Net.NetworkInformation.Ping
+        $reply = $pinger.Send($targetHostForSMB, 1500)
+        if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+            Write-Log "$($reply.RoundtripTime) ms ($targetHostForSMB) $($BOX.CHECK)" -ForegroundColor Green
+        } else {
+            Write-Log "FILTERED ($($reply.Status))" -ForegroundColor Yellow
+        }
+        $pinger.Dispose()
+    } catch [System.Exception] {
+        Write-Log "SKIPPED ($($_.Exception.Message))" -ForegroundColor DarkGray
     }
 
     if ($smbReachable -or $ForceInstall) {
@@ -1538,6 +1629,15 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
                 $isDefault = $true
             } else {
                 Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Yellow
+            }
+        }
+
+        if ($Duplex -and (Get-Command Set-PrintConfiguration -ErrorAction SilentlyContinue)) {
+            try {
+                Set-PrintConfiguration -PrinterName $usedUNC -DuplexingMode TwoSidedLongEdge -ErrorAction SilentlyContinue
+                Write-Log "    Policy : Duplex (Two-Sided Long-Edge) $($BOX.CHECK)" -ForegroundColor DarkCyan
+            } catch [System.Exception] {
+                Write-Verbose "Could not configure duplex print ticket: $($_.Exception.Message)"
             }
         }
 

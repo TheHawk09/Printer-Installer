@@ -8,6 +8,9 @@
 *.psm1 text eol=crlf
 *.psd1 text eol=crlf
 
-# Linux/Unix shell scripts and documentation must always have LF line endings
+# Linux/Unix shell scripts, Nix expressions, and documentation must always have LF line endings
 *.sh text eol=lf
+*.nix text eol=lf
 *.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

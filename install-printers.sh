@@ -22,7 +22,10 @@ FALLBACK_IP="172.16.0.32"
 INTERNAL_DNS_SERVERS=("172.16.0.7" "172.16.0.8")
 PRINTERS=("L-Kopiator" "TB-Kopiator" "PB-Kopiator")
 DEFAULT_PRINTER=""
+PRINT_FILE=""
 PRINT_TEST_PAGE=false
+START_PAPERCUT=false
+DUPLEX_MODE=true
 UNINSTALL_MODE=false
 LIST_INSTALLED_MODE=false
 LIST_AVAILABLE_MODE=false
@@ -277,6 +280,9 @@ show_notice_box() {
 # DISTRO & ENVIRONMENT DETECTION
 # -------------------------------------------------------------
 detect_distro() {
+    IS_NIXOS=false
+    IS_OSTREE=false
+
     if [ -f /etc/os-release ]; then
         # shellcheck disable=SC1091
         . /etc/os-release
@@ -287,6 +293,34 @@ detect_distro() {
         DISTRO_ID="unknown"
         DISTRO_NAME="Generic Linux"
         DISTRO_LIKE=""
+    fi
+
+    if [ -f /etc/NIXOS ] || [ "$DISTRO_ID" = "nixos" ]; then
+        DISTRO_ID="nixos"
+        DISTRO_NAME="NixOS"
+        IS_NIXOS=true
+    fi
+
+    if [ -f /run/ostree-booted ] || [ -d /sys/fs/ostree ]; then
+        IS_OSTREE=true
+    fi
+}
+
+check_printer_group() {
+    local required_group="lpadmin"
+    case "$DISTRO_ID" in
+        debian|ubuntu|linuxmint|pop) required_group="lpadmin" ;;
+        arch|manjaro|endeavouros)   required_group="lp" ;;
+        fedora|rhel|centos|rocky)   required_group="wheel" ;;
+        opensuse*|suse)             required_group="lp" ;;
+        *)                          required_group="lpadmin" ;;
+    esac
+
+    write_log "  $BOX_ARROW User Group ($required_group)   : " "$COLOR_WHITE" true
+    if id -nG 2>/dev/null | grep -qw "$required_group" || [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        write_log "MEMBER $BOX_CHECK" "$COLOR_GREEN"
+    else
+        write_log "NOT MEMBER (Requires sudo) $BOX_CROSS" "$COLOR_YELLOW"
     fi
 }
 
@@ -314,9 +348,66 @@ get_active_ssid() {
 }
 
 # -------------------------------------------------------------
+# PAPERCUT MF CLIENT UTILITIES
+# -------------------------------------------------------------
+get_papercut_status() {
+    local pid=""
+    if command -v pgrep >/dev/null 2>&1; then
+        pid=$(pgrep -x pc-client 2>/dev/null | head -n1 || true)
+        if [ -z "$pid" ]; then
+            pid=$(pgrep -f "pc-client" 2>/dev/null | head -n1 || true)
+        fi
+    elif command -v pidof >/dev/null 2>&1; then
+        pid=$(pidof pc-client 2>/dev/null | awk '{print $1}' || true)
+    fi
+
+    local candidate_paths=(
+        "$HOME/papercut/client/pc-client-linux.sh"
+        "$HOME/PaperCut/client/pc-client-linux.sh"
+        "/usr/local/papercut/client/pc-client-linux.sh"
+        "/opt/papercut/client/pc-client-linux.sh"
+        "/opt/PaperCutMF/client/pc-client-linux.sh"
+    )
+    local found_path=""
+    for cp in "${candidate_paths[@]}"; do
+        if [ -f "$cp" ] && [ -x "$cp" ]; then
+            found_path="$cp"
+            break
+        fi
+    done
+    if [ -z "$found_path" ] && command -v pc-client >/dev/null 2>&1; then
+        found_path=$(command -v pc-client)
+    fi
+
+    echo "${pid}|${found_path}"
+}
+
+start_papercut_client() {
+    local status
+    status=$(get_papercut_status)
+    local pid="${status%%|*}"
+    local path="${status##*|}"
+
+    if [ -n "$pid" ]; then
+        return 0
+    fi
+
+    if [ -n "$path" ] && [ -x "$path" ]; then
+        nohup "$path" >/dev/null 2>&1 &
+        sleep 1
+        status=$(get_papercut_status)
+        pid="${status%%|*}"
+        if [ -n "$pid" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# -------------------------------------------------------------
 # ACTION: Show Log File
 # -------------------------------------------------------------
-if [ "$SHOW_LOG_MODE" = true ]; then
+show_log_file() {
     if [ -f "$LOG_FILE" ]; then
         echo -e "${COLOR_CYAN}Opening log file: $LOG_FILE${COLOR_RESET}"
         if [ -n "${PAGER:-}" ] && command -v "$PAGER" >/dev/null 2>&1; then
@@ -330,7 +421,61 @@ if [ "$SHOW_LOG_MODE" = true ]; then
         echo -e "${COLOR_YELLOW}Log file does not exist yet at: $LOG_FILE${COLOR_RESET}"
     fi
     exit 0
-fi
+}
+
+# -------------------------------------------------------------
+# ACTION: Direct On-Demand Print (Nix / Zero-System-Mutation Mode)
+# -------------------------------------------------------------
+print_file_on_demand() {
+    local file="$1"
+    local target_printer="${DEFAULT_PRINTER:-${PRINTERS[0]}}"
+
+    if [ ! -f "$file" ]; then
+        echo -e "${COLOR_RED}File not found: '$file'${COLOR_RESET}" >&2
+        exit 1
+    fi
+
+    show_section_header "DIRECT ON-DEMAND PRINT: $target_printer" "$COLOR_CYAN"
+    write_log "  $BOX_ARROW Document : $file" "$COLOR_WHITE"
+    write_log "  $BOX_ARROW Copier   : $target_printer" "$COLOR_WHITE"
+    write_log "  $BOX_ARROW Target   : $PRINT_SERVER (Fallback IP: $FALLBACK_IP)" "$COLOR_WHITE"
+
+    # Priority 1: Use local CUPS queue if registered and working
+    if command -v lpstat >/dev/null 2>&1 && lpstat -p "$target_printer" >/dev/null 2>&1; then
+        write_log "  $BOX_ARROW Method   : Local CUPS Queue ($target_printer)... " "$COLOR_WHITE" true
+        local print_opts=()
+        if [ "$DUPLEX_MODE" = true ]; then
+            print_opts+=("-o" "sides=two-sided-long-edge")
+        fi
+        if lp -d "$target_printer" "${print_opts[@]}" "$file" >/dev/null 2>&1; then
+            write_log "SUBMITTED $BOX_CHECK" "$COLOR_GREEN"
+            show_notice_box "PRINT JOB DISPATCHED" "$COLOR_GREEN" \
+                "Job sent to local CUPS queue '$target_printer'." \
+                "PaperCut will hold the job until released at the physical copier."
+            exit 0
+        else
+            write_log "LOCAL CUPS FAILED $BOX_CROSS" "$COLOR_YELLOW"
+        fi
+    fi
+
+    # Priority 2: Direct SMB spooling (Pure hermetic execution, no local CUPS needed)
+    local target_host="$FALLBACK_IP"
+    write_log "  $BOX_ARROW Method   : Direct SMB Transmission ($target_host/$target_printer)... " "$COLOR_WHITE" true
+    if command -v smbclient >/dev/null 2>&1; then
+        if smbclient "//$target_host/$target_printer" -N -c "print $file" >/dev/null 2>&1; then
+            write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
+            show_notice_box "PRINT JOB SUBMITTED DIRECTLY" "$COLOR_GREEN" \
+                "Document sent directly over SMB to '$target_host/$target_printer'." \
+                "PaperCut will hold the job under user account '${USER:-student}'." \
+                "Zero host system changes were made."
+            exit 0
+        fi
+    fi
+
+    write_log "FAILED $BOX_CROSS" "$COLOR_RED"
+    echo -e "${COLOR_RED}Unable to transmit print job. Please ensure you are connected to GTG campus Wi-Fi.${COLOR_RESET}" >&2
+    exit 1
+}
 
 # -------------------------------------------------------------
 # ACTION: Restart CUPS Service
@@ -458,9 +603,10 @@ show_interactive_menu() {
     echo -e "  [7]  Uninstall All Copiers"
     echo -e "  [8]  Restart CUPS Spooler Service"
     echo -e "  [9]  Open Diagnostic Log"
+    echo -e "  [10] Check / Launch PaperCut MF Client"
     echo -e "  [0]  Exit"
     echo ""
-    read -r -p "  Select an option [0-9]: " choice
+    read -r -p "  Select an option [0-10]: " choice
 
     case "$choice" in
         1) "$0" --no-pause; exit 0 ;;
@@ -472,6 +618,15 @@ show_interactive_menu() {
         7) "$0" --uninstall --no-pause; exit 0 ;;
         8) "$0" --restart-cups; exit 0 ;;
         9) "$0" --show-log; exit 0 ;;
+        10)
+            if start_papercut_client; then
+                echo -e "\n${COLOR_GREEN}PaperCut Client started successfully.${COLOR_RESET}"
+            else
+                echo -e "\n${COLOR_YELLOW}PaperCut Client not found or could not be launched automatically.${COLOR_RESET}"
+            fi
+            sleep 2
+            show_interactive_menu
+            ;;
         *) exit 0 ;;
     esac
 }
@@ -485,9 +640,13 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  -s, --server <host>      Print server hostname (Default: gtcps001.gtc.local)"
             echo "  -i, --fallback-ip <ip>   Direct fallback IP address (Default: 172.16.0.32)"
+            echo "  -p, --print <file>       Print a file on-demand directly (no local queue required)"
             echo "  --printers <names>       Space-delimited list of printers to install"
             echo "  --default <name>         Specify default printer"
             echo "  --print-test-page        Send a physical test page to mapped printers"
+            echo "  --start-papercut         Automatically launch PaperCut MF Client if detected"
+            echo "  --duplex                 Enforce two-sided long-edge duplex policy (default: true)"
+            echo "  --no-duplex              Disable default two-sided (duplex) long-edge policy"
             echo "  --uninstall              Uninstall specified GTG copiers"
             echo "  --list-installed         List currently mapped CUPS printers"
             echo "  --restart-cups           Restart local CUPS print spooler"
@@ -501,12 +660,20 @@ while [[ $# -gt 0 ]]; do
             PRINT_SERVER="$2"; shift 2 ;;
         -i|--fallback-ip)
             FALLBACK_IP="$2"; shift 2 ;;
+        -p|--print)
+            PRINT_FILE="$2"; shift 2 ;;
         --printers)
             IFS=' ' read -r -a PRINTERS <<< "$2"; shift 2 ;;
         --default)
             DEFAULT_PRINTER="$2"; shift 2 ;;
         --print-test-page)
             PRINT_TEST_PAGE=true; shift ;;
+        --start-papercut)
+            START_PAPERCUT=true; shift ;;
+        --duplex)
+            DUPLEX_MODE=true; shift ;;
+        --no-duplex)
+            DUPLEX_MODE=false; shift ;;
         --uninstall)
             UNINSTALL_MODE=true; shift ;;
         --list-installed)
@@ -530,11 +697,36 @@ done
 detect_distro
 validate_input_params
 
-# Dispatch isolated modes
+# Dispatch non-mutating / isolated modes first
+if [ "$SHOW_LOG_MODE" = true ]; then show_log_file; fi
 if [ "$MENU_MODE" = true ]; then show_interactive_menu; fi
-if [ "$RESTART_CUPS_MODE" = true ]; then restart_cups_service; fi
 if [ "$LIST_INSTALLED_MODE" = true ]; then list_installed_printers; fi
+if [ -n "$PRINT_FILE" ]; then print_file_on_demand "$PRINT_FILE"; fi
+if [ "$RESTART_CUPS_MODE" = true ]; then restart_cups_service; fi
 if [ "$UNINSTALL_MODE" = true ]; then uninstall_printers; fi
+
+# Guard against accidental imperative mutation on NixOS unless forced
+if [ "${IS_NIXOS:-false}" = true ] && [ "$FORCE_INSTALL" = false ]; then
+    show_notice_box "NIXOS DETECTED: DECLARATIVE & ON-DEMAND OPTIONS" "$COLOR_CYAN" \
+        "NixOS is an immutable, purely functional system. You have 3 architectural paths:" \
+        "" \
+        "1. ON-DEMAND PRINTING (Hermetic, Zero-System-Mutation - Recommended):" \
+        "   Print any document directly without root or altering system options:" \
+        "     nix run github:TheHawk09/Printer-Installer -- --print <file.pdf>" \
+        "" \
+        "2. DECLARATIVE SYSTEM MODULE (Permanent across system rebuilds):" \
+        "   Import 'gtg-printers.nix' in /etc/nixos/configuration.nix:" \
+        "     imports = [ ./gtg-printers.nix ];" \
+        "     services.gtg-printers.enable = true;" \
+        "" \
+        "3. HOME MANAGER MODULE (User dotfiles without root):" \
+        "   Import 'gtg-home.nix' in ~/.config/home-manager/home.nix:" \
+        "     imports = [ ./gtg-home.nix ];" \
+        "     programs.gtg-printers.enable = true;" \
+        "" \
+        "(To imperatively configure the active CUPS daemon anyway, re-run with: --force-install)"
+    exit 0
+fi
 
 # -------------------------------------------------------------
 # MAIN INSTALLATION FLOW
@@ -546,6 +738,9 @@ header_lines=(
     "Network   : $(get_active_ssid)"
     "Log File  : $LOG_FILE"
 )
+if [ "${RUNNING_UNDER_NIX:-0}" = "1" ]; then
+    header_lines+=("Runtime   : Nix Store (Hermetic Closure)")
+fi
 
 write_log ""
 show_box_title "ENTERPRISE NETWORK PRINTER MANAGER (LINUX)" "${header_lines[@]}"
@@ -557,6 +752,7 @@ show_section_header "STEP 1/4: LOCAL PRINT SPOOLER (CUPS) & BACKENDS" "$COLOR_CY
 write_log "  $BOX_ARROW CUPS Commands (lpadmin)  : " "$COLOR_WHITE" true
 if command -v lpadmin >/dev/null 2>&1; then
     write_log "FOUND $BOX_CHECK" "$COLOR_GREEN"
+    check_printer_group
 else
     write_log "MISSING $BOX_CROSS" "$COLOR_RED"
     echo ""
@@ -618,7 +814,7 @@ fi
 # Check CUPS SMB backend (smbspool)
 write_log "  $BOX_ARROW CUPS SMB Backend (smb)   : " "$COLOR_WHITE" true
 smb_backend_found=false
-for b_path in /usr/lib/cups/backend/smb /usr/libexec/cups/backend/smb; do
+for b_path in /usr/lib/cups/backend/smb /usr/libexec/cups/backend/smb /var/lib/cups/backend/smb; do
     if [ -x "$b_path" ] || [ -L "$b_path" ]; then
         smb_backend_found=true
         break
@@ -634,14 +830,24 @@ if [ "$smb_backend_found" = true ]; then
     write_log "FOUND $BOX_CHECK" "$COLOR_GREEN"
 else
     write_log "MISSING $BOX_CROSS" "$COLOR_YELLOW"
-    # Auto-heal: check if smbspool is installed on the system and link it
+    # Auto-heal: locate smbspool dynamically across PATH, Nix store, or standard FHS
     smbspool_bin=""
-    for b in /usr/bin/smbspool /usr/sbin/smbspool /usr/local/bin/smbspool; do
-        if [ -x "$b" ]; then smbspool_bin="$b"; break; fi
+    if command -v smbspool >/dev/null 2>&1; then
+        smbspool_bin=$(command -v smbspool)
+    else
+        for b in /usr/bin/smbspool /usr/sbin/smbspool /usr/local/bin/smbspool; do
+            if [ -x "$b" ]; then smbspool_bin="$b"; break; fi
+        done
+    fi
+
+    cups_backend_dir=""
+    for d in /var/lib/cups/backend /usr/lib/cups/backend /usr/libexec/cups/backend; do
+        if [ -d "$d" ]; then cups_backend_dir="$d"; break; fi
     done
-    if [ -n "$smbspool_bin" ] && [ -d /usr/lib/cups/backend ]; then
+
+    if [ -n "$smbspool_bin" ] && [ -n "$cups_backend_dir" ]; then
         write_log "  $BOX_ARROW Auto-linking smbspool to CUPS backend... " "$COLOR_WHITE" true
-        if sudo ln -sf "$smbspool_bin" /usr/lib/cups/backend/smb 2>/dev/null; then
+        if sudo ln -sf "$smbspool_bin" "$cups_backend_dir/smb" 2>/dev/null; then
             write_log "LINKED $BOX_CHECK" "$COLOR_GREEN"
             smb_backend_found=true
         else
@@ -651,6 +857,30 @@ else
     if [ "$smb_backend_found" = false ]; then
         write_log "    Note: Samba printing backend (smbclient/samba-client) is recommended for Windows queues." "$COLOR_YELLOW"
     fi
+fi
+
+# Check PaperCut MF Client
+write_log "  $BOX_ARROW PaperCut MF Client     : " "$COLOR_WHITE" true
+pc_status=$(get_papercut_status)
+pc_pid="${pc_status%%|*}"
+pc_path="${pc_status##*|}"
+
+if [ -n "$pc_pid" ]; then
+    write_log "RUNNING (PID $pc_pid) $BOX_CHECK" "$COLOR_GREEN"
+elif [ -n "$pc_path" ]; then
+    write_log "STOPPED (Found at $pc_path)" "$COLOR_YELLOW"
+    if [ "$START_PAPERCUT" = true ]; then
+        write_log "  $BOX_ARROW Launching PaperCut... " "$COLOR_WHITE" true
+        if start_papercut_client; then
+            write_log "STARTED $BOX_CHECK" "$COLOR_GREEN"
+        else
+            write_log "FAILED $BOX_CROSS" "$COLOR_RED"
+        fi
+    else
+        write_log "    Note: PaperCut client must be running to release jobs at copiers." "$COLOR_GRAY"
+    fi
+else
+    write_log "NOT DETECTED (Run pc-client to release jobs)" "$COLOR_GRAY"
 fi
 
 # Step 2: Network & Server Reachability with Interactive Retry
@@ -719,6 +949,28 @@ while [ "$network_loop_active" = true ]; do
 
     if [ "$smb_reachable" = true ] || [ "$FORCE_INSTALL" = true ]; then
         write_log "OPEN on $active_server $BOX_CHECK" "$COLOR_GREEN"
+
+        # Ping ICMP RTT Latency Telemetry
+        write_log "  $BOX_ARROW Ping Latency (ICMP)   : " "$COLOR_WHITE" true
+        if command -v ping >/dev/null 2>&1; then
+            ping_out=$(ping -c 1 -W 2 "$active_server" 2>/dev/null || true)
+            if [ -n "$ping_out" ] && echo "$ping_out" | grep -q "1 received"; then
+                rtt=$(echo "$ping_out" | awk -F'/' '/rtt|round-trip/ {print $5}' || true)
+                if [ -z "$rtt" ]; then
+                    rtt=$(echo "$ping_out" | awk -F'time=' '/time=/ {print $2}' | awk '{print $1}' || true)
+                fi
+                if [ -n "$rtt" ]; then
+                    write_log "${rtt} ms ($active_server) $BOX_CHECK" "$COLOR_GREEN"
+                else
+                    write_log "REACHABLE ($active_server) $BOX_CHECK" "$COLOR_GREEN"
+                fi
+            else
+                write_log "FILTERED / TIMEOUT" "$COLOR_YELLOW"
+            fi
+        else
+            write_log "SKIPPED (ping not found)" "$COLOR_GRAY"
+        fi
+
         network_loop_active=false
     else
         write_log "TIMEOUT ($active_server:445 unreachable) $BOX_CROSS" "$COLOR_YELLOW"
@@ -810,6 +1062,13 @@ for (( p_idx=0; p_idx<total_printers; p_idx++ )); do
         (( success_count++ ))
         write_log "    Status : $(get_progress_bar_string 100) CONNECTED $BOX_CHECK" "$COLOR_GREEN"
         write_log "    Driver : $used_driver" "$COLOR_DARKCYAN"
+
+        # Configure Duplex Two-Sided Long-Edge policy
+        if [ "$DUPLEX_MODE" = true ] && command -v lpoptions >/dev/null 2>&1; then
+            if lpoptions -p "$printer" -o sides=two-sided-long-edge >/dev/null 2>&1; then
+                write_log "    Policy : Duplex (Two-Sided Long-Edge) $BOX_CHECK" "$COLOR_DARKCYAN"
+            fi
+        fi
 
         # Check default printer setting
         is_default=false

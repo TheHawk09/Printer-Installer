@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  windows-validation:
+    name: Windows PowerShell & Security Audit
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: PowerShell AST Parser Syntax Validation
+        shell: pwsh
+        run: |
+          $files = @("Install-Printers.ps1", "Detect-Printers.ps1")
+          $hasError = $false
+          foreach ($f in $files) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              Write-Host "::error file=$f::Syntax errors detected: $($errors.Count)"
+              $errors | ForEach-Object { Write-Host "Line $($_.Extent.StartLineNumber): $($_.Message)" }
+              $hasError = $true
+            } else {
+              Write-Host "AST validation passed: $f"
+            }
+          }
+          if ($hasError) { exit 1 }
+
+      - name: Verify Zero Empty Catch Blocks
+        shell: pwsh
+        run: |
+          $files = @("Install-Printers.ps1", "Detect-Printers.ps1", "Kopiator.bat")
+          $pattern = [regex]'(?i)catch\s*(\[[^\]]*\])?\s*\{\s*\}'
+          $hasEmpty = $false
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              $content = Get-Content $f -Raw
+              $matches = $pattern.Matches($content)
+              if ($matches.Count -gt 0) {
+                Write-Host "::error file=$f::Found $($matches.Count) empty catch block(s)!"
+                $hasEmpty = $true
+              }
+            }
+          }
+          if ($hasEmpty) { exit 1 }
+          Write-Host "All catch blocks handle errors and telemetry properly."
+
+      - name: Verify Zero Emojis in Script Files
+        shell: python
+        run: |
+          import os, re, unicodedata, sys
+          files = ['Install-Printers.ps1', 'Detect-Printers.ps1', 'Kopiator.bat', 'install-printers.sh', 'gtg-printers.nix', 'gtg-home.nix', 'flake.nix', 'README.md']
+          def is_emoji(ch):
+              code = ord(ch)
+              if code > 0x1F000 or (0x1F300 <= code <= 0x1F9FF):
+                  return True
+              if 0x2600 <= code <= 0x27BF:
+                  if ch in ['✔', '✘', '▸', '★', '☆', '☎', '✓', '✕', '▲', '▼', '◄', '►']:
+                      return False
+                  if 'EMOJI' in unicodedata.name(ch, '') or unicodedata.category(ch) in ('So', 'Sk'):
+                      return True
+              return False
+
+          found = []
+          for fname in files:
+              if not os.path.exists(fname): continue
+              with open(fname, 'r', encoding='utf-8', errors='ignore') as f:
+                  for lnum, line in enumerate(f, 1):
+                      for cnum, ch in enumerate(line, 1):
+                          if is_emoji(ch):
+                              found.append((fname, lnum, cnum, ch, ord(ch)))
+          if found:
+              for item in found:
+                  print(f"::error file={item[0]},line={item[1]}::Emoji detected: {item[3]} (U+{item[4]:04X})")
+              sys.exit(1)
+          print("Zero emojis verified across all files.")
+
+  linux-validation:
+    name: Linux Bash, CUPS & Nix Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Bash Script Syntax (bash -n)
+        run: |
+          bash -n install-printers.sh
+          echo "Bash syntax validation passed."
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck on install-printers.sh
+        run: |
+          # Check for errors and serious warnings (exclude intentional styling/patterns)
+          shellcheck -e SC2034,SC2154,SC2181,SC1090,SC1091 install-printers.sh
+          echo "ShellCheck audit passed."
+
+      - name: Verify Line Endings (LF for Linux/Nix scripts)
+        run: |
+          for f in install-printers.sh gtg-printers.nix gtg-home.nix flake.nix; do
+            if [ -f "$f" ]; then
+              if file "$f" | grep -q "CRLF"; then
+                echo "::error file=$f::File $f contains CRLF line terminators; LF required!"
+                exit 1
+              fi
+            fi
+          done
+          echo "All Linux and Nix scripts have correct LF line endings."
+
+      - name: Install Nix Package Manager
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Validate Nix Flake (nix flake check)
+        run: |
+          nix flake check
+          echo "Nix flake validation passed."
