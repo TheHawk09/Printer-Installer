@@ -569,7 +569,8 @@ uninstall_printers() {
     local end_time
     end_time=$(date +%s%N 2>/dev/null || date +%s)
     local elapsed_ms=$(( (end_time - START_TIME) / 1000000 ))
-    local elapsed_sec=$(awk "BEGIN {printf \"%.1f\", $elapsed_ms/1000}" 2>/dev/null || echo "0.5")
+    local elapsed_sec
+    elapsed_sec=$(awk "BEGIN {printf \"%.1f\", $elapsed_ms/1000}" 2>/dev/null || echo "0.5")
 
     local summary_lines=("${uninstall_results[@]}")
     summary_lines+=("")
