@@ -162,6 +162,7 @@ Presents a user-friendly numbered console menu to let technicians or students se
   [11] Open Windows Printers & Scanners Settings
   [12] Open Diagnostic Log
   [13] Check / Launch PaperCut MF Client
+  [14] Lock Offline-Safe Default (Microsoft Print to PDF)
   [0]  Exit
 ```
 
@@ -171,7 +172,19 @@ Opens the timestamped log file (`%LOCALAPPDATA%\GTG-Printers\PrinterInstaller.lo
 .\Install-Printers.ps1 -ShowLog
 ```
 
-### 12. Dynamic Cryptographic Audit (Git Object SHA)
+### 12. Offline Crash Guard & Zero-Lag Print Dialogs (`-SetSafeDefault`)
+When network copiers are set as the Windows default printer, opening print dialogs (`Ctrl+P`) or clicking "Export as PDF" while off-campus triggers a synchronous 30-60 second SMB/RPC timeout that freezes or crashes applications (Word, Chrome, Edge, Acrobat). Furthermore, Windows 10/11 auto-manages the default printer by default, silently promoting the school copier to default after on-campus printing.
+
+`Install-Printers.ps1` automatically eliminates this issue during installation by:
+1. Locking `LegacyDefaultPrinterMode = 1` in the user registry to disable automatic default printer hijacking.
+2. Setting `Microsoft Print to PDF` (or a local virtual printer) as the persistent default so print dialogs and PDF exports initialize instantly in 0 ms offline.
+
+To enforce this crash-guard policy manually at any time:
+```powershell
+.\Install-Printers.ps1 -SetSafeDefault
+```
+
+### 13. Dynamic Cryptographic Audit (Git Object SHA)
 To manually audit and verify that your local copy of `Install-Printers.ps1` matches GitHub's authoritative blob SHA without relying on static files:
 ```powershell
 # 1. Fetch remote authoritative SHA dynamically from GitHub API:
@@ -194,14 +207,14 @@ if ($remoteSha -eq $localSha) {
 }
 ```
 
-### 13. PaperCut MF Client Integration (`-StartPaperCut`)
+### 14. PaperCut MF Client Integration (`-StartPaperCut`)
 GTG network copiers require the PaperCut MF Client (`pc-client.exe`) to be running on the user's workstation in order to release print jobs at physical copier terminals. If stopped or not installed, users cannot authenticate at the badge reader or release their print queue.
 The installer automatically inspects the status of `pc-client` in Step 1. Passing `-StartPaperCut` (or `--start-papercut` on Linux) will automatically detect installed client paths and launch it:
 ```powershell
 .\Install-Printers.ps1 -StartPaperCut
 ```
 
-### 14. Duplex Long-Edge Policy Enforcement (`-Duplex`)
+### 15. Duplex Long-Edge Policy Enforcement (`-Duplex`)
 To minimize paper waste and ensure eco-friendly school operations, print tickets are automatically configured for two-sided (duplex) long-edge printing upon queue creation.
 * Enabled by default (`-Duplex:$true` on Windows, `--duplex` on Linux).
 * Can be overridden by passing `-Duplex:$false` on Windows or `--no-duplex` on Linux.

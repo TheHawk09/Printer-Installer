@@ -8,17 +8,17 @@ let
     {
       name = "L-Kopiator";
       location = "GTG Campus - L Building";
-      description = "Konica Minolta Copier (L Building)";
+      description = "GTG Copier (L Building)";
     }
     {
       name = "TB-Kopiator";
       location = "GTG Campus - TB Building";
-      description = "Konica Minolta Copier (TB Building)";
+      description = "GTG Copier (TB Building)";
     }
     {
       name = "PB-Kopiator";
       location = "GTG Campus - PB Building";
-      description = "Konica Minolta Copier (PB Building)";
+      description = "GTG Copier (PB Building)";
     }
   ];
 in

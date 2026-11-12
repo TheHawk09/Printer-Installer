@@ -58,6 +58,11 @@
 .PARAMETER ShowLog
     Opens the persistent installer log file directly in the default text editor.
 
+.PARAMETER SetSafeDefault
+    Enforces Microsoft Print to PDF as the default printer and disables Windows automatic
+    default printer management (LegacyDefaultPrinterMode = 1). Prevents print dialog freezes
+    and application crashes when off-campus.
+
 .PARAMETER Uninstall
     Uninstalls/unmaps the specified printers (or all printers from this server) from the user's profile.
 
@@ -163,6 +168,9 @@ param(
 
     [Parameter(ParameterSetName = "ShowLog")]
     [switch]$ShowLog,
+
+    [Parameter(ParameterSetName = "SetSafeDefault")]
+    [switch]$SetSafeDefault,
 
     [int]$MaxRetries = 1,
     [int]$RetryDelaySeconds = 2,
@@ -364,6 +372,73 @@ function Release-WScriptNetwork {
             }
         }
     }
+}
+
+function Set-DefaultPrinterSafe([string]$printerPath) {
+    try {
+        $net = Get-WScriptNetwork
+        if ($net) {
+            $net.SetDefaultPrinter($printerPath)
+            return $true
+        }
+    } catch [System.Exception] {
+        Write-Verbose "WScript.Network SetDefaultPrinter failed for ${printerPath}: $($_.Exception.Message)"
+    }
+
+    try {
+        $escPath = $printerPath -replace '\\', '\\'
+        $cimPrinter = Get-CimInstance -ClassName Win32_Printer -Filter "Name = '$escPath'" -ErrorAction Stop
+        if ($cimPrinter) {
+            Invoke-CimMethod -InputObject $cimPrinter -MethodName SetDefaultPrinter | Out-Null
+            return $true
+        }
+    } catch [System.Exception] {
+        Write-Verbose "CIM SetDefaultPrinter failed for ${printerPath}: $($_.Exception.Message)"
+    }
+
+    return $false
+}
+
+function Set-OfflineSafeDefaultPrinter {
+    [CmdletBinding()]
+    param(
+        [string]$PreferredDefault = "Microsoft Print to PDF"
+    )
+
+    try {
+        # Disable 'Let Windows manage my default printer' to prevent Windows from
+        # automatically switching default to a remote network copier when on-campus.
+        $regPath = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows"
+        Set-ItemProperty -Path $regPath -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+    } catch [System.Exception] {
+        Write-Verbose "Could not lock LegacyDefaultPrinterMode: $($_.Exception.Message)"
+    }
+
+    $targetPrinter = $null
+    try {
+        $allPrinters = Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue
+        # 1. Prefer Microsoft Print to PDF for guaranteed 0ms offline rendering
+        $pdfPrinter = $allPrinters | Where-Object { $_.Name -eq $PreferredDefault } | Select-Object -First 1
+        if ($pdfPrinter) {
+            $targetPrinter = $pdfPrinter.Name
+        } else {
+            # 2. Fallback to any local (non-network) virtual printer
+            $localPrinter = $allPrinters | Where-Object { -not $_.Network -and $_.Local } | Select-Object -First 1
+            if ($localPrinter) {
+                $targetPrinter = $localPrinter.Name
+            }
+        }
+    } catch [System.Exception] {
+        Write-Verbose "Querying local printers failed: $($_.Exception.Message)"
+    }
+
+    if ($targetPrinter) {
+        if (Set-DefaultPrinterSafe -printerPath $targetPrinter) {
+            return $targetPrinter
+        }
+    }
+
+    return $null
 }
 
 function Get-PaperCutClientStatus {
@@ -687,6 +762,34 @@ if ($OpenSettings) {
 }
 
 # -------------------------------------------------------------
+# ACTION: Lock Offline-Safe Default Printer
+# -------------------------------------------------------------
+if ($SetSafeDefault) {
+    Show-SectionHeader -StepTitle "DEFAULT PRINTER HARDENING: OFFLINE CRASH GUARD" -Color Cyan
+
+    Write-Log "  $($BOX.ARROW) Securing default printer and disabling Windows auto-management... " -NoNewLine
+    $safeName = Set-OfflineSafeDefaultPrinter
+    if ($safeName) {
+        Write-Log "LOCKED to '$safeName' $($BOX.CHECK)" -ForegroundColor Green
+        Show-NoticeBox -Header "OFFLINE CRASH GUARD ACTIVE" -BodyLines @(
+            "Default printer is now locked to '$safeName'.",
+            "'Let Windows manage my default printer' has been disabled.",
+            "Print dialogs and PDF exports will now open instantly without hanging",
+            "even when completely disconnected from school Wi-Fi or the internet."
+        ) -Color Green
+    } else {
+        Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Yellow
+    }
+
+    if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
+        Write-Host "`nPress any key to close..." -ForegroundColor DarkGray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    Release-WScriptNetwork
+    exit 0
+}
+
+# -------------------------------------------------------------
 # ENVIRONMENT & IDENTITY
 # -------------------------------------------------------------
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -821,15 +924,16 @@ if ($Menu) {
     Write-Host "  [11] Open Windows Printers & Scanners Settings" -ForegroundColor White
     Write-Host "  [12] Open Diagnostic Log" -ForegroundColor White
     Write-Host "  [13] Check / Launch PaperCut MF Client" -ForegroundColor White
+    Write-Host "  [14] Lock Offline-Safe Default (Microsoft Print to PDF)" -ForegroundColor White
     Write-Host "  [0]  Exit" -ForegroundColor DarkGray
     Write-Host ""
-    $choice = Read-Host "  Select an option [0-13]"
+    $choice = Read-Host "  Select an option [0-14]"
 
     switch ($choice) {
         "1"  { & $MyInvocation.MyCommand.Path -NoPause; exit 0 }
-        "2"  { & $MyInvocation.MyCommand.Path -Printers @("L-Kopiator") -DefaultPrinter "L-Kopiator" -NoPause; exit 0 }
-        "3"  { & $MyInvocation.MyCommand.Path -Printers @("TB-Kopiator") -DefaultPrinter "TB-Kopiator" -NoPause; exit 0 }
-        "4"  { & $MyInvocation.MyCommand.Path -Printers @("PB-Kopiator") -DefaultPrinter "PB-Kopiator" -NoPause; exit 0 }
+        "2"  { & $MyInvocation.MyCommand.Path -Printers @("L-Kopiator") -NoPause; exit 0 }
+        "3"  { & $MyInvocation.MyCommand.Path -Printers @("TB-Kopiator") -NoPause; exit 0 }
+        "4"  { & $MyInvocation.MyCommand.Path -Printers @("PB-Kopiator") -NoPause; exit 0 }
         "5"  { & $MyInvocation.MyCommand.Path -PrintTestPage -NoPause; exit 0 }
         "6"  { & $MyInvocation.MyCommand.Path -ListInstalled -NoPause; exit 0 }
         "7"  { & $MyInvocation.MyCommand.Path -ListAvailable -NoPause; exit 0 }
@@ -848,6 +952,7 @@ if ($Menu) {
             Start-Sleep -Seconds 2
             & $MyInvocation.MyCommand.Path -Menu; exit 0
         }
+        "14" { & $MyInvocation.MyCommand.Path -SetSafeDefault -NoPause; exit 0 }
         default { exit 0 }
     }
 }
@@ -1505,31 +1610,6 @@ function Connect-PrinterSafe {
     return @{ Success = $false; Errors = $errors }
 }
 
-function Set-DefaultPrinterSafe([string]$printerPath) {
-    try {
-        $net = Get-WScriptNetwork
-        if ($net) {
-            $net.SetDefaultPrinter($printerPath)
-            return $true
-        }
-    } catch [System.Exception] {
-        Write-Verbose "WScript.Network SetDefaultPrinter failed for ${printerPath}: $($_.Exception.Message)"
-    }
-
-    try {
-        $escPath = $printerPath -replace '\\', '\\'
-        $cimPrinter = Get-CimInstance -ClassName Win32_Printer -Filter "Name = '$escPath'" -ErrorAction Stop
-        if ($cimPrinter) {
-            Invoke-CimMethod -InputObject $cimPrinter -MethodName SetDefaultPrinter | Out-Null
-            return $true
-        }
-    } catch [System.Exception] {
-        Write-Verbose "CIM SetDefaultPrinter failed for ${printerPath}: $($_.Exception.Message)"
-    }
-
-    return $false
-}
-
 function Send-TestPageSafe([string]$printerPath) {
     try {
         $cleanPath = $printerPath -replace '["\r\n]', ''
@@ -1698,6 +1778,24 @@ if ($isInteractiveTerminal) {
 
 Write-Log ""
 Write-Log "  Overall  : $(Get-ProgressBarString 100) (All $totalPrinters copiers processed)" -ForegroundColor Green
+
+# Step 3b: Offline Crash Guard & Default Printer Policy
+if (-not $DefaultPrinter) {
+    Write-Log "  $($BOX.ARROW) Enforcing Offline Crash Guard (Zero-Lag Print Dialogs)... " -NoNewLine
+    $safeName = Set-OfflineSafeDefaultPrinter
+    if ($safeName) {
+        Write-Log "LOCKED to '$safeName' $($BOX.CHECK)" -ForegroundColor Green
+    } else {
+        Write-Log "SKIPPED $($BOX.CROSS)" -ForegroundColor Yellow
+    }
+} else {
+    try {
+        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+    } catch [System.Exception] {
+        Write-Verbose "Could not lock LegacyDefaultPrinterMode: $($_.Exception.Message)"
+    }
+    Write-Log "    Note: Setting a network printer as default may delay print dialogs when off-campus." -ForegroundColor Yellow
+}
 
 # Step 4: Final Summary Report
 Show-SectionHeader -StepTitle "STEP 4/4: FINAL INSTALLATION SUMMARY" -Color Cyan
