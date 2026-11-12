@@ -486,6 +486,8 @@ try {
 }
 
 $ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+$isInteractiveTerminal = ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive -and -not [Console]::IsOutputRedirected)
 
 # -------------------------------------------------------------
 # DYNAMIC TUI ENGINE (Box-Drawing Characters)
@@ -531,6 +533,46 @@ function Get-ProgressBarString {
     $fillStr = if ($filled -gt 0) { [string]::new([char]0x2588, $filled) } else { "" }
     $emptyStr = if ($empty -gt 0) { [string]::new([char]0x2591, $empty) } else { "" }
     return "{0}{1} {2,3}%" -f $fillStr, $emptyStr, $Percent
+}
+
+function Update-WingetProgressDashboard {
+    param(
+        [int]$OverallPercent = 0
+    )
+
+    if (-not $isInteractiveTerminal) { return }
+
+    $esc = [char]0x1b
+    if ($script:dashboardRendered) {
+        Write-Host "$esc[$($script:totalDashboardLines)A" -NoNewline
+    }
+
+    # Line 1: Overall Progress Bar
+    $overallBar = Get-ProgressBarString -Percent $OverallPercent -Width 20
+    $completedCount = @($dashboardPrinters | Where-Object { $_.Done }).Count
+    $overallLine = "  Overall Progress     {0}  ({1}/{2} copiers)" -f $overallBar, $completedCount, $totalPrinters
+    Write-Host "$esc[2K$esc[G$overallLine" -ForegroundColor Cyan
+
+    # Lines 2..N: Individual Printer Progress Bars
+    for ($i = 0; $i -lt $dashboardPrinters.Count; $i++) {
+        $item = $dashboardPrinters[$i]
+        $bar = Get-ProgressBarString -Percent $item.Percent -Width 20
+        $mark = if ($item.Done) { "$($BOX.CHECK)" } elseif ($item.Failed) { "$($BOX.CROSS)" } elseif ($item.Percent -gt 0) { "$($BOX.ARROW)" } else { " " }
+        $color = if ($item.Done) {
+            [ConsoleColor]::Green
+        } elseif ($item.Failed) {
+            [ConsoleColor]::Red
+        } elseif ($item.Percent -gt 0) {
+            [ConsoleColor]::DarkCyan
+        } else {
+            [ConsoleColor]::DarkGray
+        }
+
+        $line = "  {0} [{1}/{2}] {3,-12} {4}  {5}" -f $mark, $item.Index, $totalPrinters, $item.Name, $bar, $item.Status
+        Write-Host "$esc[2K$esc[G$line" -ForegroundColor $color
+    }
+
+    $script:dashboardRendered = $true
 }
 
 function Get-DynamicWidth {
@@ -1625,46 +1667,45 @@ $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 $totalPrinters = $Printers.Count
 $isInteractiveTerminal = ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive -and -not [Console]::IsOutputRedirected)
 
+# Initialize Winget-Style Dynamic Progress Dashboard
+$dashboardPrinters = [System.Collections.Generic.List[PSCustomObject]]::new()
+for ($i = 0; $i -lt $totalPrinters; $i++) {
+    $pClean = $Printers[$i].Trim().TrimStart('\')
+    $dashboardPrinters.Add([PSCustomObject]@{
+        Index   = $i + 1
+        Name    = $pClean
+        Percent = 0
+        Status  = "Queued..."
+        Done    = $false
+        Failed  = $false
+    })
+}
+$script:dashboardRendered = $false
+$script:totalDashboardLines = 1 + $totalPrinters
+Update-WingetProgressDashboard -OverallPercent 0
+
 for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
     $printer = $Printers[$pIdx]
     $printerClean = $printer.Trim().TrimStart('\')
     $copierNum = $pIdx + 1
-
-    $overallPct = [int][Math]::Round(($pIdx / $totalPrinters) * 100)
-    Write-Log ""
-    Write-Log "  Overall  : $(Get-ProgressBarString $overallPct) (Copier $copierNum of $totalPrinters)" -ForegroundColor Cyan
-
-    if ($isInteractiveTerminal) {
-        try {
-            Write-Progress -Activity "GTG Printer Installation" -Status "Overall: $overallPct% (Copier $copierNum of $totalPrinters)" -PercentComplete $overallPct -Id 1
-        } catch [System.Exception] {
-            Write-Verbose "Write-Progress overall error: $($_.Exception.Message)"
-        }
-    }
 
     $candidatePaths = @("$activeServer\$printerClean")
     if ($FallbackIP -and $activeServer -ne "\\$FallbackIP") {
         $candidatePaths += "\\$FallbackIP\$printerClean"
     }
 
-    Write-Log "  $($BOX.ARROW) [$copierNum/$totalPrinters] $printerClean" -ForegroundColor White
-    Write-Log "    Target : $($candidatePaths[0])" -ForegroundColor DarkGray
-
     $installSuccess = $false
     $usedEngine = ""
     $usedUNC = ""
     $attemptErrors = @{}
 
+    $dashboardPrinters[$pIdx].Status = "Connecting..."
     $onProgress = {
         param([int]$pct, [string]$stage)
-        if ($isInteractiveTerminal) {
-            Write-Host ("`r    Status : {0}  {1}      " -f (Get-ProgressBarString $pct), $stage) -ForegroundColor DarkCyan -NoNewline
-            try {
-                Write-Progress -Activity "GTG Printer Installation" -Status "[$copierNum/$totalPrinters] ${printerClean}: $stage" -PercentComplete $pct -Id 2 -ParentId 1
-            } catch [System.Exception] {
-                Write-Verbose "Write-Progress copier error: $($_.Exception.Message)"
-            }
-        }
+        $dashboardPrinters[$pIdx].Percent = $pct
+        $dashboardPrinters[$pIdx].Status = $stage
+        $curOverall = [int][Math]::Round((($pIdx * 100) + $pct) / $totalPrinters)
+        Update-WingetProgressDashboard -OverallPercent $curOverall
     }
 
     foreach ($uncPath in $candidatePaths) {
@@ -1674,8 +1715,8 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
 
         for ($attempt = 1; $attempt -le ($MaxRetries + 1); $attempt++) {
             if ($attempt -gt 1) {
-                if ($isInteractiveTerminal) { Write-Host "" }
-                Write-Log "    [Retry $attempt/$($MaxRetries + 1)] Waiting $RetryDelaySeconds s..." -ForegroundColor Yellow
+                $dashboardPrinters[$pIdx].Status = "Waiting retry $attempt/$($MaxRetries + 1)..."
+                Update-WingetProgressDashboard -OverallPercent ([int][Math]::Round(($pIdx * 100) / $totalPrinters))
                 Start-Sleep -Seconds $RetryDelaySeconds
             }
 
@@ -1694,28 +1735,16 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
     }
 
     if ($installSuccess) {
-        if ($isInteractiveTerminal) {
-            Write-Host ("`r    Status : {0}  CONNECTED {1} ({2})                                " -f (Get-ProgressBarString 100), $BOX.CHECK, $usedEngine) -ForegroundColor Green
-        }
-        Write-Log "    Status : $(Get-ProgressBarString 100) CONNECTED $($BOX.CHECK)" -ForegroundColor Green -NoConsole:$isInteractiveTerminal
-        Write-Log "    Path   : $usedUNC" -ForegroundColor DarkCyan
-        Write-Log "    Engine : $usedEngine" -ForegroundColor DarkCyan
-
         $isDefault = $false
         if ($DefaultPrinter -and ($DefaultPrinter -eq $printerClean -or $DefaultPrinter -eq $usedUNC -or $DefaultPrinter -eq $printer)) {
-            Write-Log "    Default: " -NoNewLine
             if (Set-DefaultPrinterSafe -printerPath $usedUNC) {
-                Write-Log "SET $($BOX.CHECK)" -ForegroundColor Green
                 $isDefault = $true
-            } else {
-                Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Yellow
             }
         }
 
         if ($Duplex -and (Get-Command Set-PrintConfiguration -ErrorAction SilentlyContinue)) {
             try {
                 Set-PrintConfiguration -PrinterName $usedUNC -DuplexingMode TwoSidedLongEdge -ErrorAction SilentlyContinue
-                Write-Log "    Policy : Duplex (Two-Sided Long-Edge) $($BOX.CHECK)" -ForegroundColor DarkCyan
             } catch [System.Exception] {
                 Write-Verbose "Could not configure duplex print ticket: $($_.Exception.Message)"
             }
@@ -1723,14 +1752,22 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
 
         $testPageSent = $false
         if ($PrintTestPage) {
-            Write-Log "    TestPage: " -NoNewLine
             if (Send-TestPageSafe -printerPath $usedUNC) {
-                Write-Log "SENT $($BOX.CHECK)" -ForegroundColor Green
                 $testPageSent = $true
-            } else {
-                Write-Log "FAILED $($BOX.CROSS)" -ForegroundColor Yellow
             }
         }
+
+        $policyStr = if ($Duplex) { ", Duplex" } else { "" }
+        $defaultStr = if ($isDefault) { ", Default" } else { "" }
+        $dashboardPrinters[$pIdx].Percent = 100
+        $dashboardPrinters[$pIdx].Status = "CONNECTED ($usedEngine$policyStr$defaultStr)"
+        $dashboardPrinters[$pIdx].Done = $true
+        $dashboardPrinters[$pIdx].Failed = $false
+        $completedCount = @($dashboardPrinters | Where-Object { $_.Done }).Count
+        $newOverall = [int][Math]::Round(($completedCount / $totalPrinters) * 100)
+        Update-WingetProgressDashboard -OverallPercent $newOverall
+
+        Write-Log "  $($BOX.CHECK) [$copierNum/$totalPrinters] $printerClean : CONNECTED via $usedEngine (Duplex: $Duplex)" -NoConsole:$isInteractiveTerminal
 
         $results.Add([PSCustomObject]@{
             Printer   = $printerClean
@@ -1742,16 +1779,21 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
             Error     = ""
         })
     } else {
-        if ($isInteractiveTerminal) {
-            Write-Host ("`r    Status : {0}  FAILED {1}                                         " -f (Get-ProgressBarString 0), $BOX.CROSS) -ForegroundColor Red
-        }
-        Write-Log "    Status : $(Get-ProgressBarString 0) FAILED $($BOX.CROSS)" -ForegroundColor Red -NoConsole:$isInteractiveTerminal
-        
+        $dashboardPrinters[$pIdx].Percent = 0
+        $dashboardPrinters[$pIdx].Status = "FAILED"
+        $dashboardPrinters[$pIdx].Done = $false
+        $dashboardPrinters[$pIdx].Failed = $true
+        $completedCount = @($dashboardPrinters | Where-Object { $_.Done }).Count
+        $newOverall = [int][Math]::Round(($completedCount / $totalPrinters) * 100)
+        Update-WingetProgressDashboard -OverallPercent $newOverall
+
+        Write-Log "  $($BOX.CROSS) [$copierNum/$totalPrinters] $printerClean : FAILED" -ForegroundColor Red -NoConsole:$isInteractiveTerminal
+
         $translatedErrors = @()
         foreach ($key in $attemptErrors.Keys) {
             $rawMsg = $attemptErrors[$key]
             $friendlyMsg = Get-FriendlyErrorMessage -rawError $rawMsg
-            Write-Log "    Details: $key -> $friendlyMsg" -ForegroundColor Red
+            Write-Log "    Details: $key -> $friendlyMsg" -ForegroundColor Red -NoConsole:$isInteractiveTerminal
             $translatedErrors += "${key}: $friendlyMsg"
         }
 
@@ -1768,12 +1810,8 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
 }
 
 if ($isInteractiveTerminal) {
-    try {
-        Write-Progress -Activity "GTG Printer Installation" -Completed -Id 2
-        Write-Progress -Activity "GTG Printer Installation" -Completed -Id 1
-    } catch [System.Exception] {
-        Write-Verbose "Write-Progress complete error: $($_.Exception.Message)"
-    }
+    Update-WingetProgressDashboard -OverallPercent 100
+    Write-Host ""
 }
 
 Write-Log ""

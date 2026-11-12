@@ -74,7 +74,7 @@ Administrators, students, and technicians can run [`Install-Printers.ps1`](Insta
 >
 > **Automation-Aware Execution**: Passing `-NoPause` to [`Kopiator.bat`](Kopiator.bat) (e.g. `Kopiator.bat -NoPause` or `Kopiator.bat -Uninstall -NoPause`) automatically suppresses the terminal pause prompt for headless task runners and CI/CD pipelines.
 >
-> **Real-Time Visual Progress**: Displays clean bracketless progress bars (`████████████░░░░░░░░ 60%`) with simultaneous overall and per-copier tracking, alongside native Windows PowerShell `Write-Progress` taskbar integration.
+> **Winget-Style Multi-Progress Dashboard**: Displays a pinned, 4-bar dynamic progress dashboard (1 overall deployment bar + 3 per-copier status bars) that updates live in-place using ANSI terminal codes, replacing PowerShell's default progress pane with clean, zero-flicker animations.
 
 ### 1. Default Run (Install All Copiers)
 Installs and maps all three GTG network copiers (`L-Kopiator`, `TB-Kopiator`, `PB-Kopiator`) for the current user:
