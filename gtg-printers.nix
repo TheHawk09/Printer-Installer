@@ -84,8 +84,24 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
+        assertion = cfg.printers != [];
+        message = "services.gtg-printers.printers must contain at least one printer queue.";
+      }
+      {
+        assertion = builtins.all (p: builtins.isString p && builtins.stringLength p > 0) cfg.printers;
+        message = "services.gtg-printers.printers must contain only non-empty strings.";
+      }
+      {
         assertion = builtins.elem cfg.defaultPrinter cfg.printers;
         message = "services.gtg-printers.defaultPrinter ('${cfg.defaultPrinter}') must be one of the configured printers in services.gtg-printers.printers: ${concatStringsSep ", " cfg.printers}";
+      }
+      {
+        assertion = builtins.isString cfg.serverIp && builtins.stringLength cfg.serverIp > 0;
+        message = "services.gtg-printers.serverIp must not be empty.";
+      }
+      {
+        assertion = builtins.isString cfg.serverHost && builtins.stringLength cfg.serverHost > 0;
+        message = "services.gtg-printers.serverHost must not be empty.";
       }
     ];
 

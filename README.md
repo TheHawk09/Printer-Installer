@@ -10,10 +10,11 @@ Enterprise network printer deployment package for Microsoft Intune, Company Port
 | :--- | :--- | :--- | :--- |
 | [`Install-Printers.ps1`](Install-Printers.ps1) | Windows | **Core Deployment Engine** | PowerShell deployment engine with dynamic CP437 box-drawing TUI, bracketless progress bars, 4-tier connection fallback, pre-flight diagnostics, automated self-healing, uninstallation, and 11 CLI operations. |
 | [`Kopiator.bat`](Kopiator.bat) | Windows | **Zero-Config Launcher** | Double-clickable batch launcher with execution policy bypass. Automatically provisions and dynamically verifies `Install-Printers.ps1` against GitHub's authoritative Git object SHA if missing locally. |
-| [`install-printers.sh`](install-printers.sh) | FHS Linux | **Universal CUPS Engine** | Distro-agnostic Bash deployment and diagnostic engine for Arch Linux, Debian, Ubuntu, Fedora, and openSUSE. Automates CUPS queue configuration with dual-server and 3-tier driver fallback. |
-| [`gtg-printers.nix`](gtg-printers.nix) | NixOS | **Declarative NixOS Module** | Idiomatic, declarative NixOS configuration module provisioning CUPS queues, enabling Samba backends, and configuring default copiers with zero state drift. |
-| [`flake.nix`](flake.nix) | NixOS / Nix | **Flake Packaging** | Exposes `nixosModules.default` and `nixosModules.gtg-printers` for drop-in inclusion into Flake-based NixOS configurations. |
+| [`install-printers.sh`](install-printers.sh) | Linux | **Universal CUPS Engine** | Distro-agnostic Bash deployment and diagnostic engine for Arch Linux, Debian, Ubuntu, Fedora, openSUSE, and NixOS. Supports subcommands, on-demand printing, and CUPS queue configuration. |
+| [`gtg-printers.nix`](gtg-printers.nix) | NixOS | **Declarative NixOS Module** | Declarative NixOS configuration module provisioning CUPS queues, enabling Samba backends, and configuring default copiers with zero state drift. |
+| [`flake.nix`](flake.nix) | NixOS / Nix | **Flake Packaging** | Flake exposing the `gtg-printers` package, `nixosModules`, and `homeModules` for Flake-based systems. |
 | [`Detect-Printers.ps1`](Detect-Printers.ps1) | Windows | **Intune Detection Rule** | Lightweight detection rule script for Microsoft Intune Win32 app deployment, validating active mapping of all required copiers in the user profile with spooler health guards. |
+| [`LICENSE`](LICENSE) | All | **License** | MIT License. |
 | [`.gitattributes`](.gitattributes) | All | **Git Normalization** | Enforces strict Windows line endings (`CRLF`) for PowerShell and Batch scripts, and `LF` for Bash scripts, Nix expressions, and Markdown documentation. |
 
 ---
@@ -221,54 +222,47 @@ To minimize paper waste and ensure eco-friendly school operations, print tickets
 
 ---
 
-## Linux Deployment: Architectural Approaches
+## Linux Deployment: Deployment Paths
 
-Linux distributions operate under fundamentally different paradigms. To ensure maximum reliability and adhere strictly to system architecture best practices, this repository provides distinct paths:
+Linux systems support three deployment paths depending on user requirements:
 
-1. **On-Demand / Hermetic (Nix Flake App `nix run`)**: **Recommended for mobile/laptop users.** Completely isolated from system options; does not touch or mutate `/etc/nixos/configuration.nix`.
-2. **Declarative & Immutable (NixOS Module `gtg-printers.nix`)**: For users who require persistent, declarative queue definitions across system rebuilds.
-3. **Traditional FHS Linux (`install-printers.sh`)**: Native Bash engine for Arch, Debian, Ubuntu, Fedora, and openSUSE.
+1. **On-Demand Printing via Flake (`nix run`)**: Direct printing and diagnostics without root privileges or modifying system configurations.
+2. **Declarative NixOS Module (`gtg-printers.nix`)**: System-wide configuration module for NixOS workstations.
+3. **Shell Script (`install-printers.sh`)**: Direct CLI script for Arch, Debian, Ubuntu, Fedora, openSUSE, and other distributions.
 
 ---
 
-### Approach 1: On-Demand Standalone via Flake (`nix run`)
+### Approach 1: On-Demand Printing via Nix Flake (`nix run`)
 
-> **Best Practice for Nix Users**: Intermittent school/work network printers should remain separate from core system configurations. If a printer queue is declared via `hardware.printers.ensurePrinters` with network discovery, running `nixos-rebuild switch` while off-campus or offline can fail or hang the build process.
-
-Running via `nix run` packages the deployment engine into an isolated Nix closure without modifying system options:
+Running via `nix run` packages the deployment engine into an isolated Nix environment without modifying system options:
 
 ```bash
-# Direct print shortcut via Flake app (Zero host mutation, no root):
-nix run github:TheHawk09/Printer-Installer#print -- mydoc.pdf
+# Print a document directly via Nix Flake (no host changes, no root):
+nix run github:TheHawk09/Printer-Installer -- print document.pdf
 
-# Or specify custom default copier:
-nix run github:TheHawk09/Printer-Installer#print -- mydoc.pdf --default "TB-Kopiator"
-
-# Run interactive diagnostics:
+# Open interactive diagnostics menu:
 nix run github:TheHawk09/Printer-Installer
 
 # Query local CUPS inventory:
-nix run github:TheHawk09/Printer-Installer -- --list-installed
+nix run github:TheHawk09/Printer-Installer -- list
 
-# Format all Nix files using official RFC 0101 standard:
+# Format Nix files:
 nix fmt
 ```
 
-* **Zero System Impact**: Does not touch `/etc/nixos/configuration.nix` or system options.
-* **Direct Server-Side Spooling**: Sends print jobs directly to PaperCut via hermetic Samba client tools in `/nix/store`.
-* **Never Breaks Rebuilds**: Offline `nixos-rebuild switch` operations are completely decoupled.
-* **Hermetic Dependencies**: Automatically wraps `cups`, `samba` (`smbclient`), and diagnostic utilities directly from `/nix/store`.
+* **Zero System Mutation**: Sends print jobs directly to the print server without altering `/etc/nixos/configuration.nix`.
+* **Isolated Closure**: Wraps required dependencies (`cups`, `samba`) directly from the Nix store.
 
 ---
 
 ### Approach 2: NixOS Declarative Module (`gtg-printers.nix`)
 
-For users who explicitly want permanent, declarative queue enforcement in their system configuration:
+For users who want permanent, declarative queue configuration in NixOS:
 
-#### 1. Best Practices & Safety Hardening in `gtg-printers.nix`
-* **Pure Store Driver Architecture & Zero Bloat**: Unlike naive configurations, it **does not** set `services.samba.enable = true` (which would launch an SMB file server on ports 139 and 445) and avoids bloating system packages with 150 MB of Samba server daemons. It packages `smbspool` into an isolated store derivation loaded purely via `services.printing.drivers = [ smbBackend ];`.
-* **Selective Provisioning with Assertions**: Queues are declared via `printers = [ "L-Kopiator" ... ]`, verified at evaluation time by NixOS assertions so misconfigured default queues are caught immediately.
-* **Offline-Safe Raw Queues (`model = "raw"`)**: Naive setups using `model = "everywhere"` force `lpadmin` to perform live IPP network handshakes at build time. If you are off-campus, `nixos-rebuild switch` crashes with an activation error. `gtg-printers.nix` uses `model = "raw"`, which configures in < 0.05 seconds locally with zero network requests. Rendering is offloaded to the Windows Print Server and PaperCut.
+#### 1. Architecture Details
+* **Isolated SMB Backend**: Packages `smbspool` into a store derivation loaded via `services.printing.drivers = [ smbBackend ];`, avoiding full Samba server daemons.
+* **Offline-Safe Raw Queues (`model = "raw"`)**: Uses raw queues to ensure `nixos-rebuild switch` does not block on live network discovery when off-campus.
+* **Input Assertions**: Validates queue names and print server settings at Nix evaluation time.
 
 #### 2. Standard NixOS (`/etc/nixos/configuration.nix`)
 Copy [`gtg-printers.nix`](gtg-printers.nix) into `/etc/nixos/`:
@@ -285,13 +279,13 @@ Then import and enable it in `/etc/nixos/configuration.nix`:
     ./gtg-printers.nix
   ];
 
-  # Explicitly enable the GTG printers module:
+  # Enable the GTG printers module:
   services.gtg-printers = {
     enable = true;
-    printers = [ "L-Kopiator" "TB-Kopiator" "PB-Kopiator" ]; # Select queues
+    printers = [ "L-Kopiator" "TB-Kopiator" "PB-Kopiator" ];
     defaultPrinter = "L-Kopiator";
     duplex = true;
-    useDirectIp = true; # Direct fallback to 172.16.0.32
+    useDirectIp = true; # Fallback to 172.16.0.32
   };
 }
 ```
@@ -323,92 +317,72 @@ sudo nixos-rebuild switch
 }
 ```
 
-#### 4. Home Manager Declarative Preferences (`gtg-home.nix`)
-For users who manage user configurations with [Home Manager](https://github.com/nix-community/home-manager) without altering system files:
-```nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    home-manager.url = "github:nix-community/home-manager";
-    gtg-printers.url = "github:TheHawk09/Printer-Installer";
-  };
-
-  outputs = { home-manager, gtg-printers, ... }: {
-    homeConfigurations."student" = home-manager.lib.homeManagerConfiguration {
-      modules = [
-        gtg-printers.homeManagerModules.default
-        {
-          programs.gtg-printers = {
-            enable = true;
-            defaultPrinter = "L-Kopiator";
-            duplex = true; # Declaratively configures ~/.cups/lpoptions
-            autostartPaperCut = true; # Auto-launches PaperCut MF client on desktop login
-          };
-        }
-      ];
-    };
-  };
-}
-```
-Or copy [`gtg-home.nix`](gtg-home.nix) locally and import directly in `home.nix`:
+#### 4. Home Manager Preferences (`gtg-home.nix`)
+For users managing CUPS user options via Home Manager:
 ```nix
 imports = [ ./gtg-home.nix ];
 programs.gtg-printers = {
   enable = true;
-  autostartPaperCut = true;
+  defaultPrinter = "L-Kopiator";
+  duplex = true;
+  autostartPaperCut = false;
 };
 ```
 
 ---
 
-### Traditional FHS Linux Deployment (`install-printers.sh`)
+### Linux CLI Deployment (`install-printers.sh`)
 
-For standard distributions conforming to FHS, [`install-printers.sh`](install-printers.sh) provides a native Bash deployment engine. It detects distro-specific quirks and configures CUPS queues via `lpadmin` with 3-tier driver resolution.
+[`install-printers.sh`](install-printers.sh) provides a native Bash deployment engine across Linux distributions.
 
-#### 1. Distribution Specifics & Prerequisites
+#### 1. Distribution Packages
 
 | Distribution Family | Package Installation | Backend Path | CUPS Group | Daemon Service |
 | :--- | :--- | :--- | :--- | :--- |
-| **Arch Linux / Manjaro / EndeavourOS** | `sudo pacman -S --needed cups samba` | `/usr/lib/cups/backend/smb`<br>*(Auto-symlinked by script)* | `lp` | `cups.service` |
-| **Debian / Ubuntu / Mint / Pop!_OS** | `sudo apt update && sudo apt install -y cups smbclient` | `/usr/lib/cups/backend/smb` | `lpadmin` | `cups` |
-| **Fedora / RHEL / Rocky / AlmaLinux** | `sudo dnf install -y cups samba-client` | `/usr/libexec/cups/backend/smb` or `/usr/lib` | `wheel` / `sys` | `cups` |
+| **Arch Linux / Manjaro** | `sudo pacman -S --needed cups samba` | `/usr/lib/cups/backend/smb` | `lp` | `cups.service` |
+| **Debian / Ubuntu / Mint** | `sudo apt update && sudo apt install -y cups smbclient` | `/usr/lib/cups/backend/smb` | `lpadmin` | `cups` |
+| **Fedora / RHEL** | `sudo dnf install -y cups samba-client` | `/usr/libexec/cups/backend/smb` | `wheel` / `sys` | `cups` |
 | **openSUSE / SLES** | `sudo zypper install -y cups samba-client` | `/usr/lib/cups/backend/smb` | `lp` | `cups` |
-| **Fedora Silverblue / Kinoite (ostree)** | `rpm-ostree install samba-client` *(reboot required)* | `/usr/lib/cups/backend/smb` | `wheel` | `cups` |
-
-> **Arch Linux Quirk**: On Arch Linux, the `samba` package provides `/usr/bin/smbspool`, but does not create the symlink `/usr/lib/cups/backend/smb` by default. [`install-printers.sh`](install-printers.sh) automatically detects Arch and creates this link if missing.
 
 #### 2. Linux CLI Usage
 
-Make the script executable and run:
+Make the script executable:
 ```bash
 chmod +x ./install-printers.sh
+```
 
-# Standard installation of all 3 copiers:
+**Subcommands:**
+```bash
+# Interactive menu (default when run in terminal with no options):
 ./install-printers.sh
+# or explicitly:
+./install-printers.sh menu
 
-# Target custom server and fallback IP:
-./install-printers.sh --server "gtcps001.gtc.local" --fallback-ip "172.16.0.32"
+# Direct operations:
+./install-printers.sh install               # Install all copiers
+./install-printers.sh uninstall             # Remove copiers
+./install-printers.sh list                  # List installed CUPS printers
+./install-printers.sh print document.pdf    # Direct on-demand printing
+./install-printers.sh restart-cups          # Restart CUPS daemon
+./install-printers.sh log                   # View diagnostic log
+```
 
-# Install specific copier and set as default:
-./install-printers.sh --printers "L-Kopiator" --default "L-Kopiator"
+**Options & Flags:**
+```bash
+# Specific printer and target server:
+./install-printers.sh --printers "L-Kopiator" --default "L-Kopiator" --server "gtcps001.gtc.local"
 
-# Send a physical test page:
-./install-printers.sh --print-test-page
+# Plain machine-parseable output (disables TUI boxes):
+./install-printers.sh --plain list
 
-# Clean uninstallation of copiers:
-./install-printers.sh --uninstall
+# Suppress ANSI colors (also respects NO_COLOR env var):
+./install-printers.sh --no-color install
 
-# List currently installed CUPS queues:
-./install-printers.sh --list-installed
+# Force imperative installation on NixOS or bypass network check:
+./install-printers.sh --force-install
 
-# Restart local CUPS print daemon:
-./install-printers.sh --restart-cups
-
-# Interactive console menu:
-./install-printers.sh --menu
-
-# Headless / automation execution (suppress pauses):
-./install-printers.sh --no-pause
+# Display full command help:
+./install-printers.sh -h
 ```
 
 #### 3. CUPS 3-Tier Driver Fallback Architecture
@@ -479,5 +453,5 @@ All scripts implement rigorous defenses against common software vulnerabilities 
 | **`0x800704C7`** | **OPERATION CANCELED** | Driver installation prompt was dismissed or canceled by the user. | Re-run script and allow driver installation, or run `-FixPointAndPrint`. |
 | **`0x80070002`** | **DRIVER/FILE NOT FOUND** | A required driver package or `.inf` is missing from the server share. | Contact IT administrator to refresh the driver package on the print server. |
 | **`3012`** | **QUEUE NOT FOUND** | Printer queue does not exist on the specified server share. | Run `.\Install-Printers.ps1 -ListAvailable` to see valid shared queues. |
-| **`CUPS SMB Missing`** | **BACKEND NOT FOUND** | Linux CUPS lacks the `smb` backend (`smbspool`). | Script auto-links `/usr/bin/smbspool` if present; on NixOS set `services.samba.enable = true`. |
+| **`CUPS SMB Missing`** | **BACKEND NOT FOUND** | Linux CUPS lacks the `smb` backend (`smbspool`). | Install `samba-client` / `smbclient`; on NixOS enable `services.gtg-printers.enable = true` (which provides `smbBackend` automatically). |
 | **`PaperCut Stopped`** | **JOB NOT RELEASING** | Printer mapped, but jobs do not release at the physical copier. | Launch the PaperCut client (`pc-client.exe` / `pc-client`) and sign in with GTG credentials. |

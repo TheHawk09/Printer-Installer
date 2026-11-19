@@ -35,7 +35,7 @@
               # Ergonomic direct printing shortcut (gtg-print <file.pdf>)
               cat <<EOF > $out/bin/gtg-print
               #!${pkgs.runtimeShell}
-              exec "\$(dirname "\$0")/gtg-printers" --print "\$@"
+              exec "\$(dirname "\$0")/gtg-printers" print "\$@"
               EOF
               chmod +x $out/bin/gtg-print
             '';
@@ -74,8 +74,8 @@
         };
       });
 
-      # 3. Standard RFC 0101 Code Formatter: 'nix fmt'
-      formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
+      # 3. Standard Code Formatter: 'nix fmt'
+      formatter = forAllSystems (system: (pkgsFor system).nixfmt);
 
       # 4. Ephemeral Development Shell: 'nix develop'
       devShells = forAllSystems (system:
@@ -84,14 +84,10 @@
             packages = with pkgs; [
               cups
               samba
-              coreutils
-              gawk
-              gnugrep
-              gnused
               iputils
               procps
               shellcheck
-              nixfmt-rfc-style
+              nixfmt
             ];
           };
         }
@@ -122,6 +118,8 @@
       nixosModules.gtg-printers = import ./gtg-printers.nix;
 
       # 8. Declarative Home Manager Module
+      homeModules.default = import ./gtg-home.nix;
+      homeModules.gtg-printers = import ./gtg-home.nix;
       homeManagerModules.default = import ./gtg-home.nix;
       homeManagerModules.gtg-printers = import ./gtg-home.nix;
     };

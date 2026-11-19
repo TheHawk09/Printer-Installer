@@ -52,8 +52,20 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
+        assertion = cfg.printers != [];
+        message = "programs.gtg-printers.printers must contain at least one printer queue.";
+      }
+      {
+        assertion = builtins.all (p: builtins.isString p && builtins.stringLength p > 0) cfg.printers;
+        message = "programs.gtg-printers.printers must contain only non-empty strings.";
+      }
+      {
         assertion = builtins.elem cfg.defaultPrinter cfg.printers;
         message = "programs.gtg-printers.defaultPrinter ('${cfg.defaultPrinter}') must be one of the configured printers in programs.gtg-printers.printers: ${concatStringsSep ", " cfg.printers}";
+      }
+      {
+        assertion = !cfg.autostartPaperCut || (builtins.isString cfg.paperCutClientPath && builtins.stringLength cfg.paperCutClientPath > 0);
+        message = "programs.gtg-printers.paperCutClientPath must not be empty when autostartPaperCut is enabled.";
       }
     ];
 
