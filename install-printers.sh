@@ -40,6 +40,13 @@ if [ -n "${NO_COLOR:-}" ]; then
     NO_COLOR_MODE=true
 fi
 
+# SMB Authentication Parameters
+SMB_USER="${SMB_USER:-${GTG_USER:-}}"
+SMB_PASSWORD="${SMB_PASSWORD:-${GTG_PASSWORD:-}}"
+SMB_DOMAIN="${SMB_DOMAIN:-${GTG_DOMAIN:-GTC}}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+SMB_CREDENTIALS_FILE="${SMB_CREDENTIALS_FILE:-${GTG_CREDENTIALS:-$XDG_CONFIG_HOME/GTG-Printers/credentials}}"
+
 XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 LOG_DIR="$XDG_DATA_HOME/GTG-Printers"
 LOG_FILE="$LOG_DIR/PrinterInstaller.log"
@@ -535,53 +542,161 @@ print_file_on_demand() {
     fi
 
     # Priority 2: Direct SMB transmission to print server
+    if ! command -v smbclient >/dev/null 2>&1; then
+        write_log "FAILED $BOX_CROSS" "$COLOR_RED"
+        echo -e "${COLOR_RED}smbclient utility not found. Please install samba-client to use direct SMB printing.${COLOR_RESET}" >&2
+        exit 1
+    fi
+
     local smb_targets=("$FALLBACK_IP")
     if [ "$PRINT_SERVER" != "$FALLBACK_IP" ]; then
         smb_targets=("$PRINT_SERVER" "$FALLBACK_IP")
     fi
 
+    # Helper function to execute smbclient cleanly without smb.conf warnings
+    try_smb_print() {
+        local host="$1"; shift
+        smbclient "//$host/$target_printer" -s /dev/null -d 0 -W "$SMB_DOMAIN" "$@" -c "print $file" 2>&1
+    }
+
+    # Determine initial credential arguments
+    local cred_args=()
+    if [ -f "$SMB_CREDENTIALS_FILE" ]; then
+        cred_args=("-A" "$SMB_CREDENTIALS_FILE")
+    elif [ -n "$SMB_USER" ] && [ -n "$SMB_PASSWORD" ]; then
+        cred_args=("-U" "$SMB_USER%$SMB_PASSWORD")
+    elif [ -n "$SMB_USER" ]; then
+        if [ -t 0 ]; then
+            echo -en "  ${COLOR_CYAN}Enter GTG Password for $SMB_USER: ${COLOR_RESET}"
+            read -s -r SMB_PASSWORD
+            echo ""
+            cred_args=("-U" "$SMB_USER%$SMB_PASSWORD")
+        fi
+    fi
+
+    local transmission_success=false
+    local active_user="${SMB_USER:-${USER:-student}}"
     local last_smb_err=""
-    if command -v smbclient >/dev/null 2>&1; then
-        for host in "${smb_targets[@]}"; do
-            write_log "  $BOX_ARROW Method   : Direct SMB Transmission ($host/$target_printer)... " "$COLOR_WHITE" true
-            local smb_out
-            # Attempt 1: Guest / anonymous session
-            if smb_out=$(smbclient "//$host/$target_printer" -U '%' -c "print $file" 2>&1); then
+    local auth_failure=false
+
+    for host in "${smb_targets[@]}"; do
+        write_log "  $BOX_ARROW Method   : Direct SMB Transmission ($host/$target_printer)... " "$COLOR_WHITE" true
+        local smb_out=""
+
+        # 1. Try with supplied credentials / credentials file if available
+        if [ ${#cred_args[@]} -gt 0 ]; then
+            if smb_out=$(try_smb_print "$host" "${cred_args[@]}"); then
+                transmission_success=true
                 write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
-                show_notice_box "PRINT JOB SUBMITTED DIRECTLY" "$COLOR_GREEN" \
-                    "Document sent directly over SMB to '$host/$target_printer'." \
-                    "PaperCut will hold the job under user account '${USER:-student}'." \
-                    "Zero host system changes were made."
-                exit 0
-            fi
-            # Attempt 2: Current user context
-            if smb_out=$(smbclient "//$host/$target_printer" -U "${USER:-student}%" -c "print $file" 2>&1); then
-                write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
-                show_notice_box "PRINT JOB SUBMITTED DIRECTLY" "$COLOR_GREEN" \
-                    "Document sent directly over SMB to '$host/$target_printer'." \
-                    "PaperCut will hold the job under user account '${USER:-student}'." \
-                    "Zero host system changes were made."
-                exit 0
-            fi
-            # Attempt 3: -N flag
-            if smb_out=$(smbclient "//$host/$target_printer" -N -c "print $file" 2>&1); then
-                write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
-                show_notice_box "PRINT JOB SUBMITTED DIRECTLY" "$COLOR_GREEN" \
-                    "Document sent directly over SMB to '$host/$target_printer'." \
-                    "PaperCut will hold the job under user account '${USER:-student}'." \
-                    "Zero host system changes were made."
-                exit 0
+                break
             fi
             last_smb_err="$smb_out"
-            write_log "FAILED $BOX_CROSS" "$COLOR_YELLOW"
-        done
+            if echo "$smb_out" | grep -qi "ACCESS_DENIED\|LOGON_FAILURE"; then
+                auth_failure=true
+            fi
+        fi
+
+        # 2. Try guest / anonymous
+        if smb_out=$(try_smb_print "$host" -U '%'); then
+            transmission_success=true
+            write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
+            break
+        fi
+        last_smb_err="$smb_out"
+        if echo "$smb_out" | grep -qi "ACCESS_DENIED\|LOGON_FAILURE"; then
+            auth_failure=true
+        fi
+
+        # 3. Try with local username (null password)
+        if smb_out=$(try_smb_print "$host" -U "${USER:-student}%"); then
+            transmission_success=true
+            write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
+            break
+        fi
+        last_smb_err="$smb_out"
+        if echo "$smb_out" | grep -qi "ACCESS_DENIED\|LOGON_FAILURE"; then
+            auth_failure=true
+        fi
+
+        # 4. Try with -N
+        if smb_out=$(try_smb_print "$host" -N); then
+            transmission_success=true
+            write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
+            break
+        fi
+        last_smb_err="$smb_out"
+        if echo "$smb_out" | grep -qi "ACCESS_DENIED\|LOGON_FAILURE"; then
+            auth_failure=true
+        fi
+
+        write_log "FAILED $BOX_CROSS" "$COLOR_YELLOW"
+    done
+
+    # If rejected due to authentication in an interactive console, prompt for GTG credentials
+    if [ "$transmission_success" = false ] && [ "$auth_failure" = true ] && [ -t 0 ] && [ "$PLAIN_MODE" = false ]; then
+        echo ""
+        write_log "  [!] Print server ($PRINT_SERVER) requires GTG domain credentials." "$COLOR_YELLOW"
+        local p_user=""
+        local p_pass=""
+        read -r -p "  Enter GTG Username: " p_user
+        if [ -n "$p_user" ]; then
+            read -s -r -p "  Enter GTG Password: " p_pass
+            echo ""
+            active_user="$p_user"
+            for host in "${smb_targets[@]}"; do
+                write_log "  $BOX_ARROW Retrying : Direct SMB Transmission ($host/$target_printer)... " "$COLOR_WHITE" true
+                local retry_out
+                if retry_out=$(try_smb_print "$host" -U "$p_user%$p_pass"); then
+                    transmission_success=true
+                    write_log "TRANSMITTED $BOX_CHECK" "$COLOR_GREEN"
+
+                    # Prompt to persist credentials locally
+                    local save_ans=""
+                    read -r -p "  Save credentials for future printing? [Y/n]: " save_ans
+                    if [[ ! "$save_ans" =~ ^[nN]$ ]]; then
+                        mkdir -p "$(dirname "$SMB_CREDENTIALS_FILE")" 2>/dev/null || true
+                        cat <<EOF > "$SMB_CREDENTIALS_FILE"
+username = $p_user
+password = $p_pass
+domain = $SMB_DOMAIN
+EOF
+                        chmod 600 "$SMB_CREDENTIALS_FILE" 2>/dev/null || true
+                        write_log "  Credentials saved to: $SMB_CREDENTIALS_FILE" "$COLOR_DARKCYAN"
+                    fi
+                    break
+                else
+                    last_smb_err="$retry_out"
+                    write_log "REJECTED $BOX_CROSS" "$COLOR_RED"
+                fi
+            done
+        fi
+    fi
+
+    if [ "$transmission_success" = true ]; then
+        show_notice_box "PRINT JOB SUBMITTED DIRECTLY" "$COLOR_GREEN" \
+            "Document sent directly over SMB to '$target_printer'." \
+            "PaperCut will hold the job under user account '$active_user'." \
+            "Swipe your badge or log in at the physical copier to release."
+        exit 0
     fi
 
     write_log "TRANSMISSION FAILED $BOX_CROSS" "$COLOR_RED"
     if [ -n "$last_smb_err" ]; then
         echo -e "${COLOR_YELLOW}Diagnostic: $last_smb_err${COLOR_RESET}" >&2
     fi
-    echo -e "${COLOR_RED}Unable to transmit print job. Please verify network connectivity to print server ($PRINT_SERVER / $FALLBACK_IP).${COLOR_RESET}" >&2
+
+    if [ "$auth_failure" = true ]; then
+        echo "" >&2
+        echo -e "${COLOR_RED}Authentication Error: The print server rejected unauthenticated access (NT_STATUS_ACCESS_DENIED).${COLOR_RESET}" >&2
+        echo "GTG network copiers require valid domain credentials so PaperCut can track and release your job." >&2
+        echo "" >&2
+        echo "Provide credentials via:" >&2
+        echo "  ./install-printers.sh print $file --user <gtg_username>" >&2
+        echo "  or: export GTG_USER='<username>' GTG_PASSWORD='<password>'" >&2
+        echo "  or create: $SMB_CREDENTIALS_FILE (chmod 600)" >&2
+    else
+        echo -e "${COLOR_RED}Unable to transmit print job. Please verify network connectivity to print server ($PRINT_SERVER / $FALLBACK_IP).${COLOR_RESET}" >&2
+    fi
     exit 1
 }
 
@@ -866,6 +981,10 @@ while [[ $# -gt 0 ]]; do
             echo "  -s, --server <host>      Print server hostname (Default: gtcps001.gtc.local)"
             echo "  -i, --fallback-ip <ip>   Direct fallback IP address (Default: 172.16.0.32)"
             echo "  -p, --print <file>       Print a file on-demand directly"
+            echo "  -u, --user <username>    GTG domain username for SMB/PaperCut authentication"
+            echo "  -w, --password <pass>    GTG domain password"
+            echo "  -d, --domain <domain>    SMB NetBIOS domain (Default: GTC)"
+            echo "  --credentials <path>     Path to Samba credentials file"
             echo "  --printers <names>       Space-delimited list of printers to install"
             echo "  --default <name>         Specify default printer queue"
             echo "  --print-test-page        Send a physical test page to mapped printers"
@@ -895,6 +1014,18 @@ while [[ $# -gt 0 ]]; do
         -p|--print)
             if [[ $# -lt 2 || -z "${2:-}" ]]; then echo "Error: $1 requires a file path argument." >&2; exit 1; fi
             PRINT_FILE="$2"; shift 2 ;;
+        -u|--user)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then echo "Error: $1 requires a username argument." >&2; exit 1; fi
+            SMB_USER="$2"; shift 2 ;;
+        -w|--password)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then echo "Error: $1 requires a password argument." >&2; exit 1; fi
+            SMB_PASSWORD="$2"; shift 2 ;;
+        -d|--domain)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then echo "Error: $1 requires a domain argument." >&2; exit 1; fi
+            SMB_DOMAIN="$2"; shift 2 ;;
+        --credentials)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then echo "Error: $1 requires a credentials file path." >&2; exit 1; fi
+            SMB_CREDENTIALS_FILE="$2"; shift 2 ;;
         --printers)
             if [[ $# -lt 2 || -z "${2:-}" ]]; then echo "Error: $1 requires printer names." >&2; exit 1; fi
             IFS=' ' read -r -a PRINTERS <<< "$2"; shift 2 ;;
@@ -930,13 +1061,13 @@ while [[ $# -gt 0 ]]; do
         --no-color)
             NO_COLOR_MODE=true; shift ;;
         print)
+            PRINT_SUBCOMMAND=true
             shift
-            if [[ $# -lt 1 || -z "${1:-}" ]]; then
-                echo "Error: 'print' subcommand requires a file path." >&2
-                echo "Usage: ./install-printers.sh print <file.pdf>" >&2
-                exit 1
+            if [[ $# -ge 1 && "$1" != -* ]]; then
+                PRINT_FILE="$1"
+                shift
             fi
-            PRINT_FILE="$1"; shift ;;
+            ;;
         list)
             LIST_INSTALLED_MODE=true; shift ;;
         install)
@@ -950,9 +1081,22 @@ while [[ $# -gt 0 ]]; do
         log)
             SHOW_LOG_MODE=true; shift ;;
         *)
-            echo "Unknown option: $1" >&2; exit 1 ;;
+            if [[ "$1" != -* ]] && [[ -z "$PRINT_FILE" ]]; then
+                PRINT_FILE="$1"
+                shift
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
+
+if [ "${PRINT_SUBCOMMAND:-false}" = true ] && [ -z "$PRINT_FILE" ]; then
+    echo "Error: 'print' subcommand requires a file path." >&2
+    echo "Usage: ./install-printers.sh print <file.pdf> [OPTIONS]" >&2
+    exit 1
+fi
 
 # -------------------------------------------------------------
 # MAIN INSTALLATION FLOW

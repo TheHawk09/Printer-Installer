@@ -238,7 +238,10 @@ Running via `nix run` packages the deployment engine into an isolated Nix enviro
 
 ```bash
 # Print a document directly via Nix Flake (no host changes, no root):
-nix run github:TheHawk09/Printer-Installer -- print document.pdf
+nix run "github:TheHawk09/Printer-Installer#print" -- document.pdf --user <gtg_username>
+
+# Specify target copier (e.g. TB-Kopiator):
+nix run "github:TheHawk09/Printer-Installer#print" -- document.pdf --default "TB-Kopiator" --user <gtg_username>
 
 # Open interactive diagnostics menu:
 nix run github:TheHawk09/Printer-Installer
@@ -252,6 +255,7 @@ nix fmt
 
 * **Zero System Mutation**: Sends print jobs directly to the print server without altering `/etc/nixos/configuration.nix`.
 * **Isolated Closure**: Wraps required dependencies (`cups`, `samba`) directly from the Nix store.
+* **PaperCut Account Association**: Passes domain credentials so print jobs are correctly queued under your student account for badge release at physical copiers.
 
 ---
 
@@ -369,8 +373,15 @@ chmod +x ./install-printers.sh
 
 **Options & Flags:**
 ```bash
+# Direct print with GTG Active Directory / PaperCut credentials:
+./install-printers.sh print document.pdf --user <username>
+./install-printers.sh print document.pdf --user <username> --password <password>
+
 # Specific printer and target server:
 ./install-printers.sh --printers "L-Kopiator" --default "L-Kopiator" --server "gtcps001.gtc.local"
+
+# Custom Samba credentials file or domain:
+./install-printers.sh print document.pdf --credentials ~/.config/GTG-Printers/credentials --domain GTC
 
 # Plain machine-parseable output (disables TUI boxes):
 ./install-printers.sh --plain list
@@ -384,6 +395,24 @@ chmod +x ./install-printers.sh
 # Display full command help:
 ./install-printers.sh -h
 ```
+
+#### 3. GTG Active Directory & PaperCut Authentication
+
+GTG campus print servers require authentication so that PaperCut can track print jobs and release them at physical copier badge readers. When printing directly on Linux:
+* **Interactive Prompt & Auto-Save**: If credentials are not specified and the server rejects unauthenticated access (`NT_STATUS_ACCESS_DENIED`), the script interactively prompts for your GTG username and password, retries transmission immediately, and offers to save credentials to `~/.config/GTG-Printers/credentials` with secure `0600` permissions.
+* **Environment Variables**: Credentials can be configured in your shell environment:
+  ```bash
+  export GTG_USER="student.username"
+  export GTG_PASSWORD="student.password"
+  export GTG_DOMAIN="GTC"
+  ```
+* **Credentials File**: Alternatively, populate `~/.config/GTG-Printers/credentials`:
+  ```ini
+  username = student.username
+  password = student.password
+  domain = GTC
+  ```
+  Ensure permissions are locked: `chmod 600 ~/.config/GTG-Printers/credentials`.
 
 #### 3. CUPS 3-Tier Driver Fallback Architecture
 
@@ -454,4 +483,5 @@ All scripts implement rigorous defenses against common software vulnerabilities 
 | **`0x80070002`** | **DRIVER/FILE NOT FOUND** | A required driver package or `.inf` is missing from the server share. | Contact IT administrator to refresh the driver package on the print server. |
 | **`3012`** | **QUEUE NOT FOUND** | Printer queue does not exist on the specified server share. | Run `.\Install-Printers.ps1 -ListAvailable` to see valid shared queues. |
 | **`CUPS SMB Missing`** | **BACKEND NOT FOUND** | Linux CUPS lacks the `smb` backend (`smbspool`). | Install `samba-client` / `smbclient`; on NixOS enable `services.gtg-printers.enable = true` (which provides `smbBackend` automatically). |
+| **`NT_STATUS_ACCESS_DENIED`** | **AUTH REQUIRED** | Print server rejected unauthenticated access; local Linux user is not domain-joined. | Pass `--user <gtg_username>` / `-u` to prompt for password, set `GTG_USER` and `GTG_PASSWORD`, or save credentials to `~/.config/GTG-Printers/credentials` (`chmod 600`). |
 | **`PaperCut Stopped`** | **JOB NOT RELEASING** | Printer mapped, but jobs do not release at the physical copier. | Launch the PaperCut client (`pc-client.exe` / `pc-client`) and sign in with GTG credentials. |
