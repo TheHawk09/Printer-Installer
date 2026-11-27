@@ -84,6 +84,14 @@
 .PARAMETER NoPause
     Suppresses the "Press any key to close..." prompt upon completion (automatic in non-interactive/Intune runs).
 
+.PARAMETER NoPauseErrorVerbose
+    Suppresses terminal pause prompts while dumping comprehensive verbose error diagnostics
+    (engine failure codes, network status, log tail) to stdout/stderr if any operation fails.
+    Ideal for CI/CD runners, Intune packaging logs, and headless automation.
+
+.PARAMETER PauseOnError
+    Suppresses terminal pause on success, but pauses the window upon failure so errors can be inspected.
+
 .EXAMPLE
     .\Install-Printers.ps1
     Standard unattended installation of all 3 copiers.
@@ -175,8 +183,14 @@ param(
     [int]$MaxRetries = 1,
     [int]$RetryDelaySeconds = 2,
     [string]$LogPath = "",
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$NoPauseErrorVerbose,
+    [switch]$PauseOnError
 )
+
+if ($NoPauseErrorVerbose) {
+    $NoPause = $true
+}
 
 # Start execution stopwatch for performance telemetry
 $scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -709,6 +723,144 @@ function Get-FriendlyErrorMessage([string]$rawError) {
         default {
             return $rawError
         }
+    }
+}
+
+function Show-VerboseErrorDiagnostics {
+    param(
+        [System.Collections.Generic.List[PSCustomObject]]$Results = $null,
+        [string]$CustomHeader = "DETAILED VERBOSE ERROR DIAGNOSTICS",
+        [string]$CustomMessage = ""
+    )
+
+    $targetServerDisp = if (Get-Variable -Name "activeServer" -ValueOnly -ErrorAction SilentlyContinue) { $activeServer } else { $PrintServer }
+    $userDisp = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch [System.Exception] { Write-Verbose "Identity lookup: $($_.Exception.Message)"; $env:USERNAME }
+    $adminDisp = try { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch [System.Exception] { Write-Verbose "Admin check: $($_.Exception.Message)"; $false }
+
+    Write-Host ""
+    Write-Host "===============================================================================" -ForegroundColor Red
+    Write-Host "  $CustomHeader" -ForegroundColor Red
+    Write-Host "===============================================================================" -ForegroundColor Red
+
+    if ($CustomMessage) {
+        Write-Host "  Notice : $CustomMessage" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    # 1. Network & Environment Diagnostics
+    Write-Host "  [NETWORK & ENVIRONMENT]" -ForegroundColor Cyan
+    Write-Host "    * Active SSID        : $(Get-ActiveSSID)" -ForegroundColor Gray
+    Write-Host "    * Target Print Server: $targetServerDisp" -ForegroundColor Gray
+    Write-Host "    * Fallback IP        : $FallbackIP" -ForegroundColor Gray
+    Write-Host "    * Local User / Admin : $userDisp (IsAdmin: $adminDisp)" -ForegroundColor Gray
+
+    # 2. Spooler & Point-and-Print Diagnostics
+    try {
+        $spoolerService = Get-Service -Name "Spooler" -ErrorAction SilentlyContinue
+        $spoolerState = if ($spoolerService) { $spoolerService.Status } else { "Not Installed" }
+        Write-Host "    * Print Spooler State: $spoolerState" -ForegroundColor Gray
+    } catch [System.Exception] {
+        Write-Verbose "Spooler query failed in verbose diagnostics: $($_.Exception.Message)"
+    }
+
+    try {
+        $pnpKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+        if (Test-Path $pnpKey) {
+            $pnpProps = Get-ItemProperty -Path $pnpKey -ErrorAction SilentlyContinue
+            $rest = if ($null -ne $pnpProps.Restricted) { $pnpProps.Restricted } else { "NotSet" }
+            Write-Host "    * Point-and-Print Pol: Restricted=$rest" -ForegroundColor Gray
+        } else {
+            Write-Host "    * Point-and-Print Pol: Default (Unconfigured)" -ForegroundColor Gray
+        }
+    } catch [System.Exception] {
+        Write-Verbose "PointAndPrint policy query failed in verbose diagnostics: $($_.Exception.Message)"
+    }
+
+    # 3. Per-Printer Failure Breakdown
+    if ($Results) {
+        $failedItems = @($Results | Where-Object { $_.Status -eq "Failed" })
+        if ($failedItems.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  [FAILED COPIERS: DETAILED BREAKDOWN]" -ForegroundColor Cyan
+            foreach ($item in $failedItems) {
+                Write-Host "  >> $($item.Printer) ($($item.UNCPath))" -ForegroundColor Red
+                if ($item.Error) {
+                    Write-Host "     Friendly Summary: $($item.Error)" -ForegroundColor Yellow
+                }
+                if ($item.EngineErrors -and $item.EngineErrors.Count -gt 0) {
+                    Write-Host "     Engine Attempt Traces:" -ForegroundColor Gray
+                    foreach ($k in $item.EngineErrors.Keys) {
+                        $raw = $item.EngineErrors[$k]
+                        $friendly = Get-FriendlyErrorMessage -rawError $raw
+                        Write-Host "       - ${k} : $raw" -ForegroundColor DarkGray
+                        if ($friendly -ne $raw) {
+                            Write-Host "         -> Meaning: $friendly" -ForegroundColor Gray
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # 4. Recent Failure Log Tail
+    if ($LogPath -and (Test-Path $LogPath)) {
+        Write-Host ""
+        Write-Host "  [PERSISTENT LOG FILE: RECENT ENTRIES]" -ForegroundColor Cyan
+        Write-Host "    Path: $LogPath" -ForegroundColor Gray
+        try {
+            $logLines = Get-Content -LiteralPath $LogPath -Tail 15 -ErrorAction SilentlyContinue
+            if ($logLines) {
+                foreach ($ll in $logLines) {
+                    Write-Host "    | $ll" -ForegroundColor DarkGray
+                }
+            }
+        } catch [System.Exception] {
+            Write-Verbose "Could not read tail of log file: $($_.Exception.Message)"
+        }
+    }
+
+    # 5. Suggested Remediation
+    Write-Host ""
+    Write-Host "  [RECOMMENDED REMEDIATION]" -ForegroundColor Green
+    Write-Host "    1. Network: Verify connection to 'GTC Student' / 'GTC Staff' Wi-Fi or GTG VPN." -ForegroundColor Gray
+    Write-Host "    2. Point-and-Print: Run '.\Install-Printers.ps1 -FixPointAndPrint' as Administrator." -ForegroundColor Gray
+    Write-Host "    3. Spooler: Run '.\Install-Printers.ps1 -RestartSpooler' as Administrator to clear hung jobs." -ForegroundColor Gray
+    Write-Host "    4. Direct IP: Try '.\Install-Printers.ps1 -PrintServer \\$FallbackIP -ForceInstall'." -ForegroundColor Gray
+    Write-Host "===============================================================================" -ForegroundColor Red
+    Write-Host ""
+}
+
+function Show-InteractiveErrorPopup {
+    param(
+        [string]$Header,
+        [string[]]$BodyLines,
+        [string]$LogFile = ""
+    )
+
+    if (-not [Environment]::UserInteractive) { return }
+
+    try {
+        $tempReportPath = Join-Path $script:GTG_DATA_DIR "ErrorReport_$([guid]::NewGuid().ToString('N')).txt"
+        $reportContent = @()
+        $reportContent += "==============================================================================="
+        $reportContent += "  $Header"
+        $reportContent += "==============================================================================="
+        $reportContent += ""
+        foreach ($b in $BodyLines) {
+            $reportContent += "  $b"
+        }
+        $reportContent += ""
+        if ($LogFile -and (Test-Path $LogFile)) {
+            $reportContent += "  Diagnostic log: $LogFile"
+        }
+        $reportContent += "==============================================================================="
+        $reportContent += ""
+        Set-Content -LiteralPath $tempReportPath -Value $reportContent -Encoding UTF8 -Force
+
+        $popupCmd = "Get-Content -LiteralPath '$tempReportPath' | Write-Host -ForegroundColor Yellow; Write-Host '`nPress any key to close this window...' -ForegroundColor DarkGray; `$null = `$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown'); Remove-Item -LiteralPath '$tempReportPath' -Force -ErrorAction SilentlyContinue"
+        Start-Process -FilePath $script:POWERSHELL_EXE -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$popupCmd`"" -Wait
+    } catch [System.Exception] {
+        Write-Verbose "Could not pop up interactive error window: $($_.Exception.Message)"
     }
 }
 
@@ -1544,7 +1696,7 @@ while ($networkLoopActive) {
         # Check if running interactively in a console vs automated background (Intune / Company Portal)
         $isInteractiveConsole = ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive)
 
-        if ($isInteractiveConsole -and -not $NoPause) {
+        if ($isInteractiveConsole -and -not $NoPause -and -not $NoPauseErrorVerbose) {
             Show-NoticeBox -Header "NETWORK NOT REACHABLE: RETRY?" -BodyLines @(
                 "Cannot reach print server '$targetHostForSMB' on Port 445 (SMB).",
                 "Current SSID: $(Get-ActiveSSID)",
@@ -1581,6 +1733,28 @@ while ($networkLoopActive) {
                 " Device must be connected to the GTG school network (GTC Student/Staff).",
                 " (To attempt installation anyway, re-run with: .\Install-Printers.ps1 -ForceInstall)"
             ) -Color Red
+
+            if ($NoPauseErrorVerbose) {
+                Show-VerboseErrorDiagnostics -CustomHeader "FATAL NETWORK ERROR: PRINT SERVER UNREACHABLE" `
+                    -CustomMessage "Cannot reach $targetHostForSMB on SMB Port 445. Connect to GTG Wi-Fi or VPN."
+            }
+
+            if ($PauseOnError -and -not $NoPauseErrorVerbose) {
+                if ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+                    Write-Host "`nPress any key to close this window..." -ForegroundColor DarkGray
+                    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                } elseif ([Environment]::UserInteractive) {
+                    Show-InteractiveErrorPopup -Header "CONNECTION BLOCKED: PRINT SERVER UNREACHABLE" -BodyLines @(
+                        "Cannot reach print server '$targetHostForSMB' on Port 445 (SMB).",
+                        "Active Network SSID: $(Get-ActiveSSID)",
+                        "",
+                        "REASON & SOLUTION:",
+                        "Device must be connected to the GTG school network (GTC Student / Staff Wi-Fi) or VPN.",
+                        "Please connect to school Wi-Fi and re-run installation from Company Portal."
+                    ) -LogFile $LogPath
+                }
+            }
+
             Release-WScriptNetwork
             exit 2
         }
@@ -1770,13 +1944,14 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
         Write-Log "  $($BOX.CHECK) [$copierNum/$totalPrinters] $printerClean : CONNECTED via $usedEngine (Duplex: $Duplex)" -NoConsole:$isInteractiveTerminal
 
         $results.Add([PSCustomObject]@{
-            Printer   = $printerClean
-            UNCPath   = $usedUNC
-            Status    = "Connected"
-            Engine    = $usedEngine
-            IsDefault = $isDefault
-            TestPage  = $testPageSent
-            Error     = ""
+            Printer      = $printerClean
+            UNCPath      = $usedUNC
+            Status       = "Connected"
+            Engine       = $usedEngine
+            IsDefault    = $isDefault
+            TestPage     = $testPageSent
+            Error        = ""
+            EngineErrors = $null
         })
     } else {
         $dashboardPrinters[$pIdx].Percent = 0
@@ -1798,13 +1973,14 @@ for ($pIdx = 0; $pIdx -lt $totalPrinters; $pIdx++) {
         }
 
         $results.Add([PSCustomObject]@{
-            Printer   = $printerClean
-            UNCPath   = $candidatePaths[0]
-            Status    = "Failed"
-            Engine    = "None"
-            IsDefault = $false
-            TestPage  = $false
-            Error     = ($translatedErrors -join " | ")
+            Printer      = $printerClean
+            UNCPath      = $candidatePaths[0]
+            Status       = "Failed"
+            Engine       = "None"
+            IsDefault    = $false
+            TestPage     = $false
+            Error        = ($translatedErrors -join " | ")
+            EngineErrors = $attemptErrors.Clone()
         })
     }
 }
@@ -1856,9 +2032,37 @@ $summaryLines += "Log Saved to: $LogPath"
 $summaryColor = if ($failCount -gt 0) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
 Show-NoticeBox -Header "INSTALLATION OUTCOME" -BodyLines $summaryLines -Color $summaryColor
 
-if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
-    Write-Host "`nPress any key to close this window..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if ($failCount -gt 0 -and $NoPauseErrorVerbose) {
+    Show-VerboseErrorDiagnostics -Results $results `
+        -CustomHeader "FAILED PRINTER DEPLOYMENT SUMMARY ($failCount of $($results.Count) FAILED)"
+}
+
+$shouldPause = $false
+$isInteractiveHost = ($Host.Name -eq "ConsoleHost" -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected)
+if ($isInteractiveHost) {
+    if ($failCount -gt 0) {
+        if ((-not $NoPause -or $PauseOnError) -and -not $NoPauseErrorVerbose) {
+            $shouldPause = $true
+        }
+    } else {
+        if (-not $NoPause -and -not $PauseOnError) {
+            $shouldPause = $true
+        }
+    }
+} elseif ($failCount -gt 0 -and $PauseOnError -and -not $NoPauseErrorVerbose -and [Environment]::UserInteractive) {
+    # If running with a hidden or redirected console (e.g. Intune Company Portal),
+    # pop up a visible interactive error window so the user sees the diagnostic report!
+    Show-InteractiveErrorPopup -Header "INSTALLATION OUTCOME: FAILED COPIERS" `
+        -BodyLines $summaryLines -LogFile $LogPath
+}
+
+if ($shouldPause) {
+    try {
+        Write-Host "`nPress any key to close this window..." -ForegroundColor DarkGray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    } catch [System.Exception] {
+        Write-Verbose "Could not read key from host: $($_.Exception.Message)"
+    }
 }
 
 Release-WScriptNetwork

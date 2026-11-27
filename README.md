@@ -8,7 +8,7 @@ Enterprise network printer deployment package for Microsoft Intune, Company Port
 
 | File | Platform | Role | Description |
 | :--- | :--- | :--- | :--- |
-| [`Install-Printers.ps1`](Install-Printers.ps1) | Windows | **Core Deployment Engine** | PowerShell deployment engine with dynamic CP437 box-drawing TUI, bracketless progress bars, 4-tier connection fallback, pre-flight diagnostics, automated self-healing, uninstallation, and 11 CLI operations. |
+| [`Install-Printers.ps1`](Install-Printers.ps1) | Windows | **Core Deployment Engine** | PowerShell deployment engine with dynamic CP437 box-drawing TUI, bracketless progress bars, 4-tier connection fallback, pre-flight diagnostics, automated self-healing, Company Portal popup unhiding, uninstallation, and 13 CLI operations. |
 | [`Kopiator.bat`](Kopiator.bat) | Windows | **Zero-Config Launcher** | Double-clickable batch launcher with execution policy bypass. Automatically provisions and dynamically verifies `Install-Printers.ps1` against GitHub's authoritative Git object SHA if missing locally. |
 | [`install-printers.sh`](install-printers.sh) | Linux | **Universal CUPS Engine** | Distro-agnostic Bash deployment and diagnostic engine for Arch Linux, Debian, Ubuntu, Fedora, openSUSE, and NixOS. Supports subcommands, on-demand printing, and CUPS queue configuration. |
 | [`gtg-printers.nix`](gtg-printers.nix) | NixOS | **Declarative NixOS Module** | Declarative NixOS configuration module provisioning CUPS queues, enabling Samba backends, and configuring default copiers with zero state drift. |
@@ -41,10 +41,14 @@ IntuneWinAppUtil.exe -c "C:\IntuneSource\GTG-Printers" -s "Install-Printers.ps1"
 
 | Property | Value | Notes |
 | :--- | :--- | :--- |
-| **Install command** | `powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File .\Install-Printers.ps1 -NoPause` | Silent per-user deployment. |
-| **Uninstall command** | `powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File .\Install-Printers.ps1 -Uninstall -NoPause` | Clean removal from user profile. |
+| **Install command** | `powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File .\Install-Printers.ps1 -PauseOnError` | Per-user deployment: runs silently on success; pops up interactive diagnostic window on error. |
+| **Uninstall command** | `powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File .\Install-Printers.ps1 -Uninstall -PauseOnError` | Clean removal from user profile (closes on success; pops up on error). |
 | **Install behavior** | **User** | Network printer connections reside in `HKCU`, not machine-wide. |
 | **Device restart behavior** | **Determine behavior based on return codes** | No system reboot required. |
+
+> **Company Portal Failure Visibility**: When installed via Microsoft Company Portal using `-WindowStyle Hidden ... -PauseOnError`, the installer executes completely silently and invisibly in the background on success. If a deployment fails (e.g. student is at home and Port 445 is unreachable, or Point-and-Print policy blocks driver download), the installer automatically pops up an interactive visible error report window over Company Portal detailing the exact root cause, active Wi-Fi SSID, and remediation advice. As soon as the student presses any key, the popup window closes and reports the failure code to Intune.
+>
+> **Headless / Unattended Logging Alternative**: For machine automation or CI/CD pipelines where no interactive window should ever appear, replace `-PauseOnError` with `-NoPauseErrorVerbose` to capture full engine failure traces directly in Intune Management Extension (`IntuneManagementExtension.log`) without waiting for user input.
 
 ### 4. Return Codes (Exit Codes)
 
@@ -73,7 +77,7 @@ Administrators, students, and technicians can run [`Install-Printers.ps1`](Insta
 > 3. **Content Signature**: Validates authentic GTG script tokens (`ENTERPRISE NETWORK PRINTER MANAGER`, `L-Kopiator`) to reject captive portal HTML intercepts.
 > 4. **Dynamic Cryptographic Git SHA**: Dynamically queries GitHub's REST API (`/contents/Install-Printers.ps1`) to verify that the downloaded payload's Git blob SHA bit-for-bit matches GitHub's authoritative repository object hash on `main`. No hardcoded hash files needed.
 >
-> **Automation-Aware Execution**: Passing `-NoPause` to [`Kopiator.bat`](Kopiator.bat) (e.g. `Kopiator.bat -NoPause` or `Kopiator.bat -Uninstall -NoPause`) automatically suppresses the terminal pause prompt for headless task runners and CI/CD pipelines.
+> **Automation-Aware Execution**: Passing `-NoPause` to [`Kopiator.bat`](Kopiator.bat) suppresses the terminal pause prompt for headless task runners. Passing `-NoPauseErrorVerbose` ensures non-blocking automation while dumping comprehensive engine error traces if a deployment fails. Passing `-PauseOnError` closes automatically on success but pauses on error for interactive troubleshooting.
 >
 > **Winget-Style Multi-Progress Dashboard**: Displays a pinned, 4-bar dynamic progress dashboard (1 overall deployment bar + 3 per-copier status bars) that updates live in-place using ANSI terminal codes, replacing PowerShell's default progress pane with clean, zero-flicker animations.
 
@@ -219,6 +223,20 @@ The installer automatically inspects the status of `pc-client` in Step 1. Passin
 To minimize paper waste and ensure eco-friendly school operations, print tickets are automatically configured for two-sided (duplex) long-edge printing upon queue creation.
 * Enabled by default (`-Duplex:$true` on Windows, `--duplex` on Linux).
 * Can be overridden by passing `-Duplex:$false` on Windows or `--no-duplex` on Linux.
+
+### 16. Terminal Pause & Automation Flags (`-NoPause`, `-NoPauseErrorVerbose`, `-PauseOnError`)
+To support diverse automation, CI/CD runners, and student self-service scenarios:
+* **`-NoPause`**: Standard non-blocking flag. Never pauses for user input upon completion or failure.
+* **`-NoPauseErrorVerbose`**: Non-blocking automated mode. Never pauses for user input, but if an installation fails or the server is unreachable, it dumps full verbose error diagnostics (per-engine exception messages, WMI codes, Point-and-Print policy states, network diagnostics, and recent log traces) directly to standard output/standard error. Ideal for CI/CD runners, Intune packaging logs, and headless scheduled tasks.
+* **`-PauseOnError`**: Interactive troubleshooting mode. Automatically closes without prompting on success. If launched from a visible console, it pauses in-place; if launched with a hidden or redirected console (e.g. from Microsoft Company Portal via `-WindowStyle Hidden`), it automatically unhides and pops up an interactive visible error report window over the desktop so the user is directly informed of why the installation failed.
+
+```powershell
+# Headless automation with full verbose failure diagnostics:
+.\Install-Printers.ps1 -NoPauseErrorVerbose
+
+# Interactive self-service (close on success, pause on failure):
+.\Install-Printers.ps1 -PauseOnError
+```
 
 ---
 
@@ -391,6 +409,12 @@ chmod +x ./install-printers.sh
 
 # Force imperative installation on NixOS or bypass network check:
 ./install-printers.sh --force-install
+
+# Non-blocking automation with verbose failure diagnostics:
+./install-printers.sh --no-pause-error-verbose install
+
+# Close on success, pause only if errors occur:
+./install-printers.sh --pause-on-error install
 
 # Display full command help:
 ./install-printers.sh -h

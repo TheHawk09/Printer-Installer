@@ -149,13 +149,30 @@ exit /b 1
 :RUN_SCRIPT
 :: Run PowerShell script with ExecutionPolicy Bypass using pinned binary path
 "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%PS1_SCRIPT%" %*
+set "PS_EXIT=%ERRORLEVEL%"
 
-:: If -NoPause was passed, suppress final pause for automation/CI (CWE-88/CWE-78)
+:: Check if pause should be suppressed (-NoPause, -NoPauseErrorVerbose, or successful -PauseOnError)
 set "RAW_ARGS=%*"
 setlocal EnableDelayedExpansion
+set "SUPPRESS_PAUSE=0"
+
+:: If -NoPause or -NoPauseErrorVerbose is passed, always suppress pause
 echo !RAW_ARGS! | findstr /i /c:"-NoPause" >nul
-if errorlevel 1 (
+if %ERRORLEVEL% equ 0 set "SUPPRESS_PAUSE=1"
+
+:: If -PauseOnError is passed, suppress pause on success (exit 0), pause on failure (exit != 0)
+echo !RAW_ARGS! | findstr /i /c:"-PauseOnError" >nul
+if %ERRORLEVEL% equ 0 (
+    if %PS_EXIT% equ 0 (
+        set "SUPPRESS_PAUSE=1"
+    ) else (
+        set "SUPPRESS_PAUSE=0"
+    )
+)
+
+if "!SUPPRESS_PAUSE!"=="0" (
     echo.
     pause
 )
 endlocal
+exit /b %PS_EXIT%

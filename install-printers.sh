@@ -34,6 +34,8 @@ MENU_MODE=false
 SHOW_LOG_MODE=false
 FORCE_INSTALL=false
 NO_PAUSE=true
+NO_PAUSE_ERROR_VERBOSE=false
+PAUSE_ON_ERROR=false
 PLAIN_MODE=false
 NO_COLOR_MODE=false
 if [ -n "${NO_COLOR:-}" ]; then
@@ -999,6 +1001,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --force-install          Bypass pre-flight network checks or force install on NixOS"
             echo "  --pause                  Prompt before closing window on exit"
             echo "  --no-pause               Do not prompt before closing window (default)"
+            echo "  --no-pause-error-verbose Dump verbose diagnostics on error without pausing (CI/automation)"
+            echo "  --pause-on-error         Do not prompt on success, prompt on exit only if errors occurred"
             echo "  --plain, --no-interactive"
             echo "                           Clean plain-text output (disables TUI boxes and menus)"
             echo "  --no-color               Disable ANSI color codes (also respects NO_COLOR env var)"
@@ -1056,6 +1060,13 @@ while [[ $# -gt 0 ]]; do
             NO_PAUSE=false; shift ;;
         --no-pause)
             NO_PAUSE=true; shift ;;
+        --no-pause-error-verbose)
+            NO_PAUSE=true
+            NO_PAUSE_ERROR_VERBOSE=true
+            shift ;;
+        --pause-on-error)
+            PAUSE_ON_ERROR=true
+            shift ;;
         --plain|--no-interactive)
             PLAIN_MODE=true; shift ;;
         --no-color)
@@ -1534,11 +1545,44 @@ run_installation_flow() {
 
     if (( fail_count > 0 )); then
         show_notice_box "INSTALLATION OUTCOME" "$COLOR_YELLOW" "${summary_lines[@]}"
+        if [ "$NO_PAUSE_ERROR_VERBOSE" = true ]; then
+            echo "" >&2
+            echo "===============================================================================" >&2
+            echo "  FAILED PRINTER DEPLOYMENT: VERBOSE ERROR DIAGNOSTICS" >&2
+            echo "===============================================================================" >&2
+            echo "  * Distro / User    : $DISTRO_NAME ($DISTRO_ID) / ${USER:-$(whoami)}" >&2
+            echo "  * Active Network   : $(get_active_ssid)" >&2
+            echo "  * Target Server    : $PRINT_SERVER (Fallback: $FALLBACK_IP)" >&2
+            echo "  * Spooler Status   : $(command -v systemctl >/dev/null 2>&1 && systemctl is-active cups 2>/dev/null || echo 'unknown')" >&2
+            echo "  * SMB Backend      : $(command -v smbspool >/dev/null 2>&1 && echo 'Installed' || echo 'Missing smbspool')" >&2
+            if [ -f "$LOG_FILE" ]; then
+                echo "" >&2
+                echo "  [PERSISTENT LOG: RECENT ENTRIES]" >&2
+                tail -n 15 "$LOG_FILE" 2>/dev/null | sed 's/^/    | /' >&2
+            fi
+            echo "===============================================================================" >&2
+            echo "" >&2
+        fi
     else
         show_notice_box "INSTALLATION OUTCOME" "$COLOR_GREEN" "${summary_lines[@]}"
     fi
 
-    if [ "$NO_PAUSE" = false ] && [ -t 0 ]; then
+    local should_pause=false
+    if [ -t 0 ]; then
+        if (( fail_count > 0 )); then
+            if [ "$NO_PAUSE" = false ] || [ "$PAUSE_ON_ERROR" = true ]; then
+                if [ "$NO_PAUSE_ERROR_VERBOSE" = false ]; then
+                    should_pause=true
+                fi
+            fi
+        else
+            if [ "$NO_PAUSE" = false ] && [ "$PAUSE_ON_ERROR" = false ]; then
+                should_pause=true
+            fi
+        fi
+    fi
+
+    if [ "$should_pause" = true ]; then
         echo ""
         read -r -n 1 -s -p "Press any key to close this window..."
         echo ""
